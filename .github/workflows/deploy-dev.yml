@@ -1,0 +1,56 @@
+name: Deploy to Databricks Dev
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: databricks-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy app to dev
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      BUNDLE_VAR_catalog_name: ${{ secrets.DATABRICKS_CATALOG_NAME }}
+      BUNDLE_VAR_schema_name: ${{ secrets.DATABRICKS_SCHEMA_NAME }}
+      BUNDLE_VAR_warehouse_id: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Configure Databricks CLI profile
+        shell: bash
+        run: |
+          : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
+          : "${DATABRICKS_TOKEN:?Set the DATABRICKS_TOKEN repository secret}"
+          : "${BUNDLE_VAR_catalog_name:?Set the DATABRICKS_CATALOG_NAME repository secret}"
+          : "${BUNDLE_VAR_schema_name:?Set the DATABRICKS_SCHEMA_NAME repository secret}"
+          : "${BUNDLE_VAR_warehouse_id:?Set the DATABRICKS_WAREHOUSE_ID repository secret}"
+          printf '[DEFAULT]\nhost = "%s"\ntoken = "%s"\n' \
+            "$DATABRICKS_HOST" "$DATABRICKS_TOKEN" > "$HOME/.databrickscfg"
+          chmod 600 "$HOME/.databrickscfg"
+
+      - name: Deploy app and resources to dev
+        working-directory: dbxmetagen
+        run: bash deploy.sh --target dev --profile DEFAULT
