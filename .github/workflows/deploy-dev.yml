@@ -3,6 +3,7 @@ name: Deploy to Databricks Dev
 on:
   push:
     branches:
+      - feature/dbxmetagen_deploy
       - main
   workflow_dispatch:
 
