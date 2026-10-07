@@ -6,6 +6,11 @@ on:
       - feature/dbxmetagen_deploy
       - main
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
 
 permissions:
   contents: read
@@ -18,6 +23,12 @@ jobs:
   deploy:
     name: Deploy app to dev
     runs-on: ubuntu-latest
+    environment: dev
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/feature/dbxmetagen_deploy' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
     env:
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
