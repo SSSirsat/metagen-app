@@ -1,0 +1,74 @@
+variables:
+  deploying_user:
+    description: User who deploys the asset bundle (for notebook paths). Must match the deploying_user in variables.yml.
+    default: ${workspace.current_user.userName}
+  app_name:
+    description: >-
+      Display name of the Databricks App and prefix for all job names
+      (e.g. <app_name>_metadata_job). Change this to avoid collisions
+      when deploying multiple instances to the same workspace outside
+      of DAB development mode. In development mode, DAB already
+      prefixes with the deploying user's name.
+    default: "dbxmetagen-app"
+  app_name_suffix:
+    description: >-
+      Optional suffix appended to the app name and job-name prefix (e.g.
+      "-dev", "-team1"). Empty by default so the app is named exactly
+      app_name. Set this to deploy multiple independent instances to ONE
+      workspace (e.g. different targets or teams) without them overwriting
+      each other's single app resource.
+    default: ""
+  app_lifecycle:
+    description: >-
+      App lifecycle block for the app resource. Default {} is SAFE ON BOTH deploy
+      engines -- `bundle deploy` registers the app + syncs files, and you start it
+      with `bundle run dbxmetagen_app` (deploy.sh does this for you; in the UI, click
+      the run icon on the app resource). Set it to {"started": true} for a ONE-STEP
+      deploy that also deploys the app source and starts it -- ONLY on the DIRECT
+      engine (the workspace UI and fresh CLI deploys). IMPORTANT: the `started` field
+      is DIRECT-ENGINE-ONLY; a bundle whose state was created by an older deploy.sh/CLI
+      run stays on the TERRAFORM engine (the CLI does not auto-migrate) and terraform
+      REJECTS `started` at build time ("lifecycle.started is only supported in direct
+      deployment mode"). This is a COMPLEX variable, so it can only be overridden via
+      variable-overrides.json (NOT via --var or BUNDLE_VAR_*, which the CLI rejects for
+      complex types). UI one-step: add "app_lifecycle": {"started": true} in the same
+      ⋮ > Configure variable overrides editor where you set catalog_name.
+    type: complex
+    default: {}
+  app_display_name:
+    description: >-
+      Display name shown in the app UI title bar. Overridable via
+      variable-overrides.json, but the value MUST be non-empty -- an empty value
+      is stripped by the DAB SDK (omitempty) and the Apps deploy then rejects it.
+      Defaults to the app name.
+    default: "dbxmetagen"
+  user_api_scopes:
+    description: >-
+      OAuth scopes the app DECLARES for On-Behalf-Of user auth. Declared on EVERY
+      deploy (requires the workspace "Apps - user token passthrough" feature). Scopes:
+      files.files (UC volumes), sql.statement-execution (SQL), dashboards.genie
+      (Genie) -- the three the app actively uses under the user token -- plus
+      serving.serving-endpoints (model serving under the user token; declared for
+      parity with the notebook deploy path and future OBO serving calls, not exercised
+      by the app today -- drop it if you want a minimal consent surface). enable_obo is
+      a SEPARATE runtime switch for WHICH principal makes the call (user token vs app
+      SP) and does NOT gate this declaration. Override only to add/remove scopes.
+    type: complex
+    default: ["files.files", "serving.serving-endpoints", "sql.statement-execution", "dashboards.genie"]
+  app_permissions:
+    description: >-
+      Who can open the app UI (CAN_USE). Empty by default; the deploying user
+      already has CAN_MANAGE via the target permissions block. Override this
+      complex variable to grant groups/users, e.g.
+      [{"group_name": "account users", "level": "CAN_USE"}].
+    type: complex
+    default: []
+  lakebase_catalog:
+    description: "Lakebase catalog name for GraphRAG graph data"
+    default: "dbxmetagen_graphrag"
+  lakebase_instance_name:
+    description: "Lakebase instance name"
+    default: "dbxmetagen"
+  lakebase_database_name:
+    description: "PG-level database name within the Lakebase instance"
+    default: "knowledge_base"

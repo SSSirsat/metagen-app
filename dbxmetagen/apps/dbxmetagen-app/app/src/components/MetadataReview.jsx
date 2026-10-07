@@ -1,0 +1,2403 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import { safeFetch, ErrorBanner, PrereqBanner } from '../App'
+import { FKApplyPanel } from './ForeignKeyGeneration'
+import { CoveragePanel } from './Coverage'
+import { PageHeader, EmptyState, SkeletonTable } from './ui'
+import { useCatalogSchemaTables } from '../hooks/useCatalogSchemaTables'
+
+function DataTable({ data, maxRows = 100 }) {
+  if (!data || data.length === 0) return <p className="text-sm text-slate-400 py-4">No data available.</p>
+  const cols = Object.keys(data[0])
+  return (
+    <div className="overflow-x-auto rounded-xl shadow-card border border-slate-300 dark:border-slate-600">
+      <table className="min-w-full text-sm bg-white dark:bg-slate-800">
+        <thead><tr>{cols.map(c =>
+          <th key={c} className="text-left px-3 py-2.5 bg-slate-100 dark:bg-slate-700 font-semibold text-slate-800 dark:text-slate-100 border-b border-slate-300 dark:border-slate-600 text-xs uppercase tracking-wider sticky top-0">{c}</th>
+        )}</tr></thead>
+        <tbody>
+          {data.slice(0, maxRows).map((row, i) => (
+            <tr key={i} className="border-b border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+              {cols.map(c => <td key={c} className="px-3 py-2 max-w-xs truncate text-slate-800 dark:text-slate-200">{String(row[c] ?? '')}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// Compact evidence cell for an FK prediction row: the data probes behind the
+// score (referential integrity · actual join hit rate · parent-key uniqueness),
+// each colored by strength so a reviewer can verify rather than trust the number.
+// Renders "—" for a signal that was never computed (e.g. sampling disabled).
+function fkEvidence(fk) {
+  const pct = (v) => (v == null || v === '' || Number.isNaN(Number(v)))
+    ? null : `${Math.round(Number(v) * 100)}%`
+  const cls = (v) => v == null ? 'text-slate-300 dark:text-slate-600'
+    : Number(v) >= 0.95 ? 'text-emerald-600 dark:text-emerald-400'
+    : Number(v) >= 0.7 ? 'text-amber-600 dark:text-amber-400'
+    : 'text-red-600 dark:text-red-400'
+  const parts = [
+    { k: 'ri_score', label: 'RI', title: 'Referential integrity: fraction of child rows whose key exists in the parent' },
+    { k: 'join_rate', label: 'join', title: 'Actual join hit rate on sampled rows' },
+    { k: 'pk_uniqueness', label: 'PK', title: 'Parent-side key uniqueness (a true FK needs a near-unique parent key)' },
+  ]
+  return (
+    <span className="inline-flex gap-1.5">
+      {parts.map(p => (
+        <span key={p.k} className={cls(fk[p.k])} title={p.title}>{pct(fk[p.k]) ?? '—'}</span>
+      ))}
+    </span>
+  )
+}
+
+const Tip = ({ text }) => (
+  <span className="relative group ml-1.5 inline-flex align-middle">
+    <button
+      type="button"
+      className="text-slate-400 dark:text-slate-500 text-xs font-bold border border-slate-300 dark:border-dbx-navy-400 rounded-full w-4 h-4 inline-flex items-center justify-center shrink-0 hover:text-dbx-teal hover:border-dbx-teal transition-colors cursor-help focus:outline-none focus:ring-2 focus:ring-dbx-teal/60 focus:ring-offset-1 dark:focus:ring-offset-dbx-navy-600"
+      aria-label={text}
+    >
+      ?
+    </button>
+    <span className="absolute z-50 hidden group-hover:block group-focus-within:block bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-60 text-xs bg-dbx-navy dark:bg-dbx-navy-600 text-white rounded-xl px-3 py-2 shadow-elevated pointer-events-none animate-fade-in">{text}</span>
+  </span>
+)
+
+// ---------------------------------------------------------------------------
+// Review Editor -- scope picker, metadata type filter, inline edit, export
+// ---------------------------------------------------------------------------
+const META_TYPES = [
+  { key: 'comments', label: 'Comments' },
+  { key: 'pii', label: 'PII / PHI' },
+  { key: 'domain', label: 'Domain' },
+  { key: 'ontology', label: 'Ontology' },
+  { key: 'fk', label: 'Foreign Keys' },
+]
+
+const PROPERTY_ROLE_GROUPS = [
+  { label: 'Identifiers', roles: ['primary_key', 'business_key'] },
+  { label: 'Measures', roles: ['measure', 'derived'] },
+  { label: 'Dimensions', roles: ['dimension', 'temporal', 'geographic', 'label'] },
+  { label: 'Relationships', roles: ['object_property', 'composite_component'] },
+  { label: 'Governance', roles: ['pii', 'audit'] },
+  { label: 'Other', roles: ['attribute'] },
+]
+
+const LEGACY_ROLE_MAP = {
+  'link': 'object_property',
+  'foreign_key': 'object_property',
+  'identifier': 'primary_key',
+  'boolean_flag': 'dimension',
+  'code': 'dimension',
+  'geo': 'geographic',
+  'system_metadata': 'audit',
+  'timestamp': 'temporal',
+  'hierarchy_level': 'dimension',
+  'text_freeform': 'label',
+}
+
+function ReviewEditor() {
+  // kbOnly: the Pick Tables list must offer only tables that already have
+  // generated metadata in the knowledge base. information_schema lists every
+  // table in the schema, but review-combined only returns KB rows -- picking an
+  // unprocessed table silently returns nothing ("nothing loads").
+  const cst = useCatalogSchemaTables('', '', { kbOnly: true })
+  const { catalogs, schemas, filtered: filteredTables, catalog: selectedCatalog, schema: selectedSchema, filter: tableFilter, setCatalog: setSelectedCatalog, setSchema: setSelectedSchema, setFilter: setTableFilter } = cst
+  const allSchemaTableCount = cst.allSchemaTableCount
+  const [scopeMode, setScopeMode] = useState('schema')
+  const [selectedTables, setSelectedTables] = useState([])
+  const [activeType, setActiveType] = useState('comments')
+  const [reviewData, setReviewData] = useState([])
+  const [original, setOriginal] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [info, setInfo] = useState(null)
+  const [expanded, setExpanded] = useState({})
+  // Bulk table entry: paste a comma/newline-delimited list of fully-scoped names.
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  // Server-side pagination for the review table list. Page size is intentionally
+  // small: each card can expand to ~100 column rows plus FK/ontology detail, so
+  // 25 cards/page keeps a page light and reviewable. Backend caps `limit` at 500.
+  const REVIEW_PAGE_SIZE = 25
+  // Hard cap on how many tables a user can select for one review. Keeps the
+  // review-combined WHERE (an N-way table_name = ... OR) small and keeps a
+  // selection to a human-reviewable batch; larger schemas use schema mode.
+  const MAX_REVIEW_SELECTION = 100
+  // Cap on how many table checkboxes render in the picker at once; the filter
+  // box narrows a large (5k+) schema down to find anything past the cap.
+  const PICK_RENDER_CAP = 300
+  const [reviewOffset, setReviewOffset] = useState(0)
+  const [reviewTotal, setReviewTotal] = useState(0)
+  const [reviewHasMore, setReviewHasMore] = useState(false)
+  // Per-table "show all columns" opt-in. Wide tables render only the first
+  // COL_RENDER_CAP columns until the user expands, so a 1000-column table
+  // doesn't build 1000 <tr> at once.
+  const COL_RENDER_CAP = 100
+  const [colsShowAll, setColsShowAll] = useState({})
+  const [saving, setSaving] = useState(false)
+  const [ddlSql, setDdlSql] = useState('')
+  const [ddlLoading, setDdlLoading] = useState(false)
+  const [ddlApplyResult, setDdlApplyResult] = useState(null)
+  const [exportLoading, setExportLoading] = useState(false)
+  const [exportResult, setExportResult] = useState(null)
+  const [entityTypeOptions, setEntityTypeOptions] = useState([])
+  const [entityTypeOverrides, setEntityTypeOverrides] = useState({})
+  const [expandedEntities, setExpandedEntities] = useState({})
+  const [ontoApplyResults, setOntoApplyResults] = useState({})
+  const [ontoApplying, setOntoApplying] = useState({})
+  const [selectedFKs, setSelectedFKs] = useState({})
+  const [fkApplyResult, setFkApplyResult] = useState(null)
+  const [fkApplying, setFkApplying] = useState(false)
+  const [expandedFKs, setExpandedFKs] = useState({})
+  const [recommendedEntity, setRecommendedEntity] = useState({})
+  const [recEntLoading, setRecEntLoading] = useState({})
+  const [colPropOverrides, setColPropOverrides] = useState({})
+  const [propTagApplying, setPropTagApplying] = useState({})
+  const [propTagResults, setPropTagResults] = useState({})
+  const [ontoConfThreshold, setOntoConfThreshold] = useState(0.5)
+  const [tableTagApplying, setTableTagApplying] = useState({})
+  const [tableTagResults, setTableTagResults] = useState({})
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [resultFilter, setResultFilter] = useState('')
+  const [resultSchemaFilter, setResultSchemaFilter] = useState('')
+  const [importLoading, setImportLoading] = useState(false)
+  const [importResult, setImportResult] = useState(null)
+  const [showVolumeBrowser, setShowVolumeBrowser] = useState(false)
+  const [volumeFiles, setVolumeFiles] = useState([])
+  const [volumeFilesLoading, setVolumeFilesLoading] = useState(false)
+  const [volumeFilesError, setVolumeFilesError] = useState(null)
+  const [ddlError, setDdlError] = useState(null)
+
+  // DDL bundle state
+  const [bundleTypes, setBundleTypes] = useState({
+    comments: false, domain: false, sensitivity: false, ontology: false,
+    fk: false,
+  })
+  const [fkMode, setFkMode] = useState('tags')
+  const [bundleSql, setBundleSql] = useState('')
+  const [bundleSections, setBundleSections] = useState(null)
+  const [bundleCounts, setBundleCounts] = useState(null)
+  const [bundleWarnings, setBundleWarnings] = useState(null)
+  const [bundleLoading, setBundleLoading] = useState(false)
+  const [bundleError, setBundleError] = useState(null)
+  const [bundleApplyResult, setBundleApplyResult] = useState(null)
+  const [bundleApplyProgress, setBundleApplyProgress] = useState(null)
+  const [bundleVolumePath, setBundleVolumePath] = useState(null)
+  const [bundleTargetCatalog, setBundleTargetCatalog] = useState('')
+  const [bundleTargetSchema, setBundleTargetSchema] = useState('')
+  const [globalOntoApplying, setGlobalOntoApplying] = useState(false)
+  const [globalOntoResult, setGlobalOntoResult] = useState(null)
+  const [globalFkTagApplying, setGlobalFkTagApplying] = useState(false)
+  const [globalFkTagResult, setGlobalFkTagResult] = useState(null)
+  const [fkConfThreshold, setFkConfThreshold] = useState(0.5)
+  const [fkGenSql, setFkGenSql] = useState(null)
+  const [fkDeleting, setFkDeleting] = useState(false)
+
+  const deleteFkPredictions = async (preds) => {
+    setFkDeleting(true)
+    try {
+      const r = await fetch('/api/analytics/fk-delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ predictions: preds }),
+      })
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok) return { error: j.detail || `Server error (${r.status})` }
+      if (j.deleted > 0) {
+        setReviewData(prev => prev.map(tbl => ({
+          ...tbl,
+          fk_predictions: (tbl.fk_predictions || []).filter(fk =>
+            !preds.some(p => p.src_column === fk.src_column && p.dst_column === fk.dst_column)
+          ),
+        })))
+        setSelectedFKs({})
+      }
+      return j
+    } catch (err) {
+      return { error: err.message }
+    } finally {
+      setFkDeleting(false)
+    }
+  }
+
+  useEffect(() => { fetch('/api/ontology/entity-type-options').then(r => r.json()).then(d => setEntityTypeOptions(Array.isArray(d) ? d : [])).catch(() => {}) }, [])
+
+  const toggleTable = t => setSelectedTables(prev => {
+    if (prev.includes(t)) return prev.filter(x => x !== t)  // removal always allowed
+    if (prev.length >= MAX_REVIEW_SELECTION) {
+      // Hard cap: never silently ignore — tell the user why the click did nothing.
+      setInfo(`You can review up to ${MAX_REVIEW_SELECTION} tables at a time. Deselect some, or use schema mode to review a whole large schema.`)
+      return prev
+    }
+    return [...prev, t]
+  })
+  // O(1) membership for the per-row checkbox render (avoids .includes() per checkbox).
+  const selectedTableSet = useMemo(() => new Set(selectedTables), [selectedTables])
+  const atSelectionCap = selectedTables.length >= MAX_REVIEW_SELECTION
+
+  // Bulk-add tables from a pasted comma/newline-delimited list of (ideally fully-
+  // scoped) names, e.g. "catalog.schema.t1, catalog.schema.t2". Review & Apply
+  // reviews ONE schema at a time, so every qualified entry must resolve to a single
+  // catalog.schema -- we adopt it (setting the Catalog/Schema selectors) and add the
+  // short names to the current selection, deduped and capped at MAX_REVIEW_SELECTION.
+  // Short ("table") or partial ("schema.table") entries inherit the resolved scope.
+  const addPastedTables = () => {
+    // Per-part char set mirrors the backend _SAFE_IDENT_RE ([a-zA-Z0-9_.\- %]).
+    const IDENT = /^[A-Za-z0-9_\- %]+$/
+    const stripTicks = s => s.trim().replace(/^`|`$/g, '').trim()
+    const raw = pasteText.split(/[\n,]+/).map(stripTicks).filter(Boolean)
+    if (!raw.length) return
+    const parsed = [], invalid = []
+    for (const entry of raw) {
+      const parts = entry.split('.').map(stripTicks)
+      if (parts.length > 3 || parts.some(p => !p || !IDENT.test(p))) { invalid.push(entry); continue }
+      let cat, sch, tbl
+      if (parts.length === 3) [cat, sch, tbl] = parts
+      else if (parts.length === 2) [sch, tbl] = parts
+      else [tbl] = parts
+      parsed.push({ cat, sch, tbl })
+    }
+    const qCats = [...new Set(parsed.map(p => p.cat).filter(Boolean))]
+    const qSchemas = [...new Set(parsed.map(p => p.sch).filter(Boolean))]
+    if (qCats.length > 1 || qSchemas.length > 1) {
+      setInfo(null)
+      setError(`Paste tables from a single schema only — Review & Apply reviews one schema at a time (found ${Math.max(qCats.length, qSchemas.length)} distinct schemas).`)
+      return
+    }
+    const targetCat = qCats[0] || selectedCatalog
+    const targetSch = qSchemas[0] || selectedSchema
+    if (!targetCat || !targetSch) {
+      setInfo(null)
+      setError('Paste fully-scoped names (catalog.schema.table), or select a Catalog and Schema first.')
+      return
+    }
+    // Entries that explicitly named a different scope than the resolved one are skipped.
+    const names = [], wrongScope = []
+    for (const p of parsed) {
+      if ((p.cat && p.cat !== targetCat) || (p.sch && p.sch !== targetSch)) { wrongScope.push(p.tbl); continue }
+      names.push(p.tbl)
+    }
+    // Compute the merge from the current selection (pure; safe under StrictMode).
+    const existing = new Set(selectedTables)
+    let added = 0, overCap = 0
+    const toAdd = []
+    for (const n of names) {
+      if (existing.has(n)) continue
+      if (selectedTables.length + toAdd.length >= MAX_REVIEW_SELECTION) { overCap++; continue }
+      existing.add(n); toAdd.push(n); added++
+    }
+    // Adopt scope + table mode, then apply the merged selection.
+    if (targetCat !== selectedCatalog) setSelectedCatalog(targetCat)
+    if (targetSch !== selectedSchema) setSelectedSchema(targetSch)
+    setScopeMode('table')
+    if (toAdd.length) setSelectedTables(prev => {
+      const set = new Set(prev), next = [...prev]
+      for (const n of toAdd) { if (!set.has(n) && next.length < MAX_REVIEW_SELECTION) { set.add(n); next.push(n) } }
+      return next
+    })
+    const bits = [`Added ${added} table${added === 1 ? '' : 's'}`]
+    if (overCap) bits.push(`${overCap} skipped (cap ${MAX_REVIEW_SELECTION})`)
+    if (wrongScope.length) bits.push(`${wrongScope.length} skipped (different schema)`)
+    if (invalid.length) bits.push(`${invalid.length} skipped (invalid name)`)
+    setError(null); setInfo(bits.join(' · '))
+    setPasteText('')
+  }
+
+  const loadData = async (offset = 0) => {
+    // Belts-and-suspenders: block (don't silently truncate) a table-mode load that
+    // exceeds the selection cap — e.g. a seeded/programmatic selection. Schema mode
+    // is unbounded (server-paginated), so it's exempt.
+    if (scopeMode === 'table' && selectedTables.length > MAX_REVIEW_SELECTION) {
+      setError(`Selected ${selectedTables.length} tables — reduce to ${MAX_REVIEW_SELECTION} or fewer, or switch to schema mode to review a whole large schema.`)
+      return
+    }
+    setLoading(true); setError(null); setDdlSql(''); setDdlApplyResult(null); setExportResult(null)
+    setResultFilter(''); setResultSchemaFilter('')
+    const body = scopeMode === 'schema'
+      ? { schemas: [`${selectedCatalog}.${selectedSchema}`], offset, limit: REVIEW_PAGE_SIZE }
+      : { tables: selectedTables.map(t => `${selectedCatalog}.${selectedSchema}.${t}`), offset, limit: REVIEW_PAGE_SIZE }
+    try {
+      const res = await fetch('/api/metadata/review-combined', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      })
+      if (!res.ok) {
+        let detail = `Server error (${res.status})`
+        try { const ej = await res.json(); detail = ej.detail || detail } catch {}
+        throw new Error(detail)
+      }
+      const j = await res.json()
+      const tables = j.tables || []
+      setReviewData(tables)
+      setOriginal(JSON.parse(JSON.stringify(tables)))
+      const exp = {}; tables.forEach(t => { exp[t.table_name] = true }); setExpanded(exp)
+      setReviewOffset(offset)
+      setReviewTotal(j.total_count || tables.length)
+      setReviewHasMore(!!j.has_more)
+      if ((j.total_count || 0) > REVIEW_PAGE_SIZE) {
+        const from = offset + 1, to = offset + tables.length
+        setInfo(`Showing ${from}–${to} of ${j.total_count} tables. Use Prev/Next to page, or the filter to narrow the current page.`)
+      }
+      else if (tables.length === 0) setInfo(
+        scopeMode === 'table'
+          ? 'No generated metadata found for the selected tables. Only tables that have been processed by metadata generation appear here -- run the metadata generator on these tables first.'
+          : 'No generated metadata found for this schema. Run the metadata generator on it first, then reload.'
+      )
+      else setInfo(null)
+    } catch (e) { setError(e.message) }
+    setLoading(false)
+  }
+
+  const onTableChange = (tblIdx, field, value) => {
+    setReviewData(prev => prev.map((t, i) => i === tblIdx ? { ...t, [field]: value } : t))
+  }
+  const onColChange = (tblIdx, colIdx, field, value) => {
+    setReviewData(prev => prev.map((t, ti) => ti === tblIdx
+      ? { ...t, columns: t.columns.map((c, ci) => ci === colIdx ? { ...c, [field]: value } : c) }
+      : t))
+  }
+  const onTableCheckbox = (tblIdx, field) => {
+    setReviewData(prev => prev.map((t, i) => i === tblIdx ? { ...t, [field]: !t[field] } : t))
+  }
+
+  const dirtyTables = useMemo(() => reviewData.filter((t, i) => {
+    const o = original[i]
+    if (!o) return false
+    return ['comment', 'domain', 'subdomain', 'has_pii', 'has_phi'].some(f => t[f] !== o[f])
+  }), [reviewData, original])
+
+  const dirtyCols = useMemo(() => {
+    const list = []
+    reviewData.forEach((t, ti) => {
+      t.columns?.forEach((c, ci) => {
+        const oc = original[ti]?.columns?.[ci]
+        if (oc && ['comment', 'classification', 'classification_type'].some(f => c[f] !== oc[f]))
+          list.push(c)
+      })
+    })
+    return list
+  }, [reviewData, original])
+
+  const totalDirty = dirtyTables.length + dirtyCols.length
+
+  const saveChanges = async () => {
+    setSaving(true); setError(null)
+    try {
+      if (dirtyTables.length) {
+        const body = dirtyTables.map(r => ({ table_name: r.table_name, comment: r.comment, domain: r.domain, subdomain: r.subdomain, has_pii: r.has_pii, has_phi: r.has_phi }))
+        const res = await fetch('/api/metadata/knowledge-base', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(j.detail || res.status) }
+      }
+      if (dirtyCols.length) {
+        const body = dirtyCols.map(r => ({ column_id: r.column_id, comment: r.comment, classification: r.classification, classification_type: r.classification_type }))
+        const res = await fetch('/api/metadata/column-kb', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(j.detail || res.status) }
+      }
+      setOriginal(JSON.parse(JSON.stringify(reviewData)))
+    } catch (e) { setError(e.message) }
+    setSaving(false)
+  }
+
+  const tableNames = useMemo(() => reviewData.map(t => t.table_name), [reviewData])
+
+  const resultSchemas = useMemo(() => {
+    const set = new Set()
+    for (const t of reviewData) {
+      const parts = t.table_name.split('.')
+      if (parts.length >= 3) set.add(`${parts[0]}.${parts[1]}`)
+    }
+    return [...set].sort()
+  }, [reviewData])
+
+  const visibleReview = useMemo(() => {
+    const lf = resultFilter.toLowerCase()
+    return reviewData.filter((tbl, idx) => {
+      if (statusFilter !== 'all' && (tbl.review_status || 'unreviewed') !== statusFilter) return false
+      if (resultSchemaFilter && !tbl.table_name.startsWith(resultSchemaFilter + '.')) return false
+      if (lf && !tbl.table_name.toLowerCase().includes(lf)) return false
+      return true
+    })
+  }, [reviewData, statusFilter, resultSchemaFilter, resultFilter])
+
+  const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(25)
+  const totalPages = pageSize === 0 ? 1 : Math.ceil(visibleReview.length / pageSize)
+  const paginatedReview = useMemo(() => pageSize === 0 ? visibleReview : visibleReview.slice(page * pageSize, (page + 1) * pageSize), [visibleReview, page, pageSize])
+  useEffect(() => { setPage(0) }, [visibleReview.length, pageSize])
+
+  const [ddlCategory, setDdlCategory] = useState('comments')
+  const [customDomainKey, setCustomDomainKey] = useState('')
+  const [customSubdomainKey, setCustomSubdomainKey] = useState('')
+  const [customSensitivityKey, setCustomSensitivityKey] = useState('')
+  const [customSensitivityTypeKey, setCustomSensitivityTypeKey] = useState('')
+
+  const ddlPayload = (extra = {}) => ({
+    scope: 'table', identifiers: tableNames, ddl_type: ddlCategory,
+    ...(ddlCategory === 'domain' && customDomainKey ? { domain_tag_key: customDomainKey } : {}),
+    ...(ddlCategory === 'domain' && customSubdomainKey ? { subdomain_tag_key: customSubdomainKey } : {}),
+    ...(ddlCategory === 'sensitivity' && customSensitivityKey ? { sensitivity_tag_key: customSensitivityKey } : {}),
+    ...(ddlCategory === 'sensitivity' && customSensitivityTypeKey ? { sensitivity_type_tag_key: customSensitivityTypeKey } : {}),
+    ...extra,
+  })
+
+  const generateDdl = async () => {
+    setDdlLoading(true); setDdlApplyResult(null); setDdlError(null)
+    try {
+      const res = await fetch('/api/metadata/generate-ddl', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ddlPayload()) })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setDdlError(errMsg(j.detail || `Request failed (${res.status})`)); return }
+      const volNote = j.volume_path ? `\n-- Saved to: ${j.volume_path}` : ''
+      setDdlSql((j.sql || '') + volNote)
+    } catch (e) { setDdlError(e.message || 'Network error') }
+    finally { setDdlLoading(false) }
+  }
+  const applyDdl = async () => {
+    if (!confirm('Apply DDL changes to your catalog? This modifies table/column metadata.')) return
+    setDdlLoading(true); setDdlApplyResult(null); setDdlError(null)
+    try {
+      const res = await fetch('/api/metadata/apply-ddl', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ddlPayload()) })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setDdlApplyResult({ ok: false, detail: errMsg(j.detail || `Request failed (${res.status})`) }); return }
+      const hasErrors = j.errors && j.errors.length > 0
+      setDdlApplyResult(hasErrors ? { ok: false, applied: j.applied || 0, errors: j.errors } : { ok: true, applied: j.applied })
+    } catch (e) { setDdlApplyResult({ ok: false, detail: e.message || 'Network error' }) }
+    finally { setDdlLoading(false) }
+  }
+  const exportVolume = async (fmt) => {
+    setExportLoading(true); setExportResult(null)
+    try {
+      const res = await fetch('/api/metadata/export-volume', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tables: tableNames, format: fmt, include_columns: true, metadata_type: ddlCategory }) })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(j.detail || res.status)
+      setExportResult({ ok: true, path: j.path, rows: j.rows })
+    } catch (e) { setExportResult({ ok: false, detail: e.message }) }
+    setExportLoading(false)
+  }
+
+  // DDL bundle handlers
+  const bundlePayload = () => {
+    const types = Object.entries(bundleTypes).filter(([, v]) => v).map(([k]) => k)
+    return {
+      types,
+      fk_mode: fkMode,
+      identifiers: tableNames.length > 0 ? tableNames : undefined,
+      ...(bundleTargetCatalog ? { target_catalog: bundleTargetCatalog } : {}),
+      ...(bundleTargetSchema ? { target_schema: bundleTargetSchema } : {}),
+    }
+  }
+  const generateBundle = async () => {
+    setBundleLoading(true); setBundleError(null); setBundleApplyResult(null); setBundleApplyProgress(null)
+    setBundleSql(''); setBundleSections(null); setBundleCounts(null); setBundleWarnings(null); setBundleVolumePath(null)
+    try {
+      const res = await fetch('/api/metadata/generate-ddl-bundle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bundlePayload()) })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setBundleError(errMsg(j.detail || `Request failed (${res.status})`)); return }
+      setBundleSql(j.sql || '')
+      setBundleSections(j.sections || null)
+      setBundleCounts(j.counts || {})
+      setBundleWarnings(j.warnings || null)
+      setBundleVolumePath(j.volume_path || null)
+    } catch (e) { setBundleError(e.message || 'Network error') }
+    finally { setBundleLoading(false) }
+  }
+  const applyBundle = async () => {
+    if (!confirm('Apply all selected DDL types to your catalog? This modifies table/column metadata and may create views.')) return
+    setBundleLoading(true); setBundleError(null); setBundleApplyResult(null); setBundleApplyProgress(null)
+    try {
+      const payload = bundleSections
+        ? { sections: bundleSections }
+        : bundlePayload()
+      const endpoint = bundleSections
+        ? '/api/metadata/apply-ddl-bundle-sql'
+        : '/api/metadata/apply-ddl-bundle'
+      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setBundleApplyResult({ ok: false, detail: errMsg(j.detail || `Request failed (${res.status})`) }); return }
+      const taskId = j.task_id
+      if (!taskId) { setBundleApplyResult({ ok: false, detail: 'No task_id returned' }); return }
+      const poll = async () => {
+        for (let i = 0; i < 300; i++) {
+          await new Promise(r => setTimeout(r, 1500))
+          try {
+            const sr = await fetch(`/api/metadata/apply-ddl-bundle/status/${taskId}`)
+            const sj = await sr.json().catch(() => ({}))
+            setBundleApplyProgress(sj)
+            if (sj.status === 'done') {
+              setBundleApplyResult({ ok: (sj.total_errors || 0) === 0, applied: sj.total_applied, errors: sj.total_errors, results: sj.results })
+              setBundleVolumePath(sj.volume_path || null)
+              return
+            }
+            if (sj.status === 'error') {
+              setBundleApplyResult({ ok: false, detail: sj.error || 'Apply failed' })
+              return
+            }
+          } catch { /* retry */ }
+        }
+        setBundleApplyResult({ ok: false, detail: 'Apply timed out' })
+      }
+      await poll()
+    } catch (e) { setBundleApplyResult({ ok: false, detail: e.message || 'Network error' }) }
+    finally { setBundleLoading(false) }
+  }
+  const downloadBundleSql = () => {
+    if (!bundleSql) return
+    const blob = new Blob([bundleSql], { type: 'text/sql' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = 'ddl_bundle.sql'; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const openVolumeBrowser = async () => {
+    setShowVolumeBrowser(true)
+    setVolumeFilesLoading(true)
+    setVolumeFilesError(null)
+    try {
+      const res = await fetch('/api/metadata/volume-files')
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setVolumeFilesError(errMsg(j.detail || `Failed to list files (${res.status})`)); setVolumeFiles([]); return }
+      setVolumeFiles(Array.isArray(j) ? j : [])
+    } catch (e) { setVolumeFilesError(e.message || 'Network error'); setVolumeFiles([]) }
+    finally { setVolumeFilesLoading(false) }
+  }
+
+  const importFromVolume = async (volumePath) => {
+    setShowVolumeBrowser(false)
+    setImportLoading(true); setImportResult(null)
+    try {
+      const res = await fetch('/api/metadata/import-reviewed', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volume_path: volumePath })
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(errMsg(j.detail) || res.status)
+      setImportResult({ ok: true, ...j })
+      if (reviewData.length > 0) loadData()
+    } catch (e) { setImportResult({ ok: false, detail: e.message }) }
+    setImportLoading(false)
+  }
+
+  const importUpload = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    if (!['tsv', 'xlsx', 'xls'].includes(ext)) {
+      setImportResult({ ok: false, detail: 'Only .tsv, .xlsx, and .xls files are supported' }); return
+    }
+    setImportLoading(true); setImportResult(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch('/api/metadata/import-reviewed-upload', { method: 'POST', body: fd })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(errMsg(j.detail) || res.status)
+      setImportResult({ ok: true, ...j })
+      if (reviewData.length > 0) loadData()
+    } catch (err) { setImportResult({ ok: false, detail: err.message }) }
+    setImportLoading(false)
+  }
+
+  const errMsg = d => typeof d === 'string' ? d : (d ? JSON.stringify(d) : 'Unknown error')
+  const show = k => activeType === k
+  const chip = 'px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer select-none transition-all duration-200'
+  const chipOn = 'bg-dbx-lava text-white border-dbx-lava shadow-sm'
+  const chipOff = 'bg-white dark:bg-dbx-navy/50 text-slate-600 dark:text-slate-300 border-dbx-oat-dark dark:border-dbx-navy-400/30 hover:border-dbx-navy-400 dark:hover:border-dbx-navy-400 hover:shadow-sm'
+  const inp = 'w-full border border-slate-200 dark:border-dbx-navy-400/40 rounded-lg px-2.5 py-1.5 text-sm bg-white dark:bg-dbx-navy/60 focus:outline-none focus:ring-2 focus:ring-dbx-teal/30 focus:border-dbx-teal transition-all'
+
+  const classLabel = (val) => {
+    const v = (val ?? '').trim().toLowerCase()
+    if (!v) return { text: 'Unclassified', cls: 'bg-slate-100 text-slate-500' }
+    if (v === 'none') return { text: 'Public', cls: 'bg-green-100 text-green-700' }
+    return { text: val, cls: 'bg-red-100 text-red-700' }
+  }
+
+  const isTableDirty = (tblIdx) => {
+    const o = original[tblIdx]
+    return o && ['comment', 'domain', 'subdomain', 'has_pii', 'has_phi'].some(f => reviewData[tblIdx][f] !== o[f])
+  }
+  const isColDirty = (tblIdx, colIdx) => {
+    const oc = original[tblIdx]?.columns?.[colIdx]
+    return oc && ['comment', 'classification', 'classification_type'].some(f => reviewData[tblIdx].columns[colIdx][f] !== oc[f])
+  }
+
+  return (
+    <div className="space-y-4">
+      {cst.error && (
+        <div className="rounded-lg border border-red-200 dark:border-red-800/40 bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+          Could not load catalogs or tables. Check that the SQL warehouse is running and the app service principal has USE permissions on the target catalog. <span className="font-mono text-red-500 dark:text-red-400">{cst.error}</span>
+        </div>
+      )}
+      <ErrorBanner error={error} />
+      {info && (
+        <div className="card border-l-4 border-l-amber-400 px-4 py-3 text-sm animate-slide-up flex justify-between items-start">
+          <div>
+            <span className="font-medium text-amber-600 dark:text-amber-400">Note:</span>{' '}
+            <span className="text-slate-600 dark:text-slate-300">{info}</span>
+          </div>
+          <button onClick={() => setInfo(null)} className="text-slate-400 hover:text-slate-600 ml-2">&times;</button>
+        </div>
+      )}
+
+      {/* Catalog coverage & review-status summary (folded in from the old
+          standalone Coverage tab -- collapsed by default). */}
+      <CoveragePanel />
+
+      {/* Workflow guide -- shown when no data is loaded yet */}
+      {reviewData.length === 0 && !loading && (
+        <div className="card p-5 border-l-4 border-l-dbx-teal space-y-3">
+          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">How to use this page</h3>
+          <ol className="text-xs text-slate-600 dark:text-slate-300 space-y-2 list-decimal list-inside">
+            <li><strong>Select scope</strong> -- pick a catalog and schema below, then click <strong>Load</strong> to pull in generated metadata.</li>
+            <li><strong>Review</strong> -- switch between <em>Comments</em>, <em>PII/PHI</em>, <em>Domain</em>, <em>Ontology</em>, and <em>Foreign Keys</em> tabs to inspect and edit each metadata type. Set review status per table.</li>
+            <li><strong>Save changes</strong> -- edits to comments and classifications are saved back to the knowledge base tables when you click <em>Save Changes</em>. Review status and property roles save instantly.</li>
+            <li><strong>Apply to catalog</strong> -- scroll to <em>DDL Bundle</em> to generate and execute SQL that writes comments, tags, and constraints to your Unity Catalog tables.</li>
+          </ol>
+          <p className="text-[10px] text-slate-400 dark:text-slate-500">You can also <strong>Export</strong> metadata as TSV/Excel for offline review, then <strong>Import</strong> the edited file back.</p>
+        </div>
+      )}
+
+      {/* Scope Picker */}
+      <div className="card p-5 space-y-3">
+        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Scope</h3>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Catalog</label>
+            <select value={selectedCatalog} onChange={e => { setSelectedCatalog(e.target.value); setSelectedSchema(''); setSelectedTables([]) }}
+              className={inp}><option value="">-- select --</option>{catalogs.map(c => <option key={c}>{c}</option>)}</select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Schema</label>
+            <select value={selectedSchema} onChange={e => { setSelectedSchema(e.target.value); setSelectedTables([]) }}
+              className={inp} disabled={!selectedCatalog}><option value="">-- select --</option>{schemas.map(s => <option key={s}>{s}</option>)}</select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500 mb-1">Mode</label>
+            <div className="flex gap-2 mt-1">
+              {[['schema', 'Entire Schema'], ['table', 'Pick Tables']].map(([k, l]) =>
+                <label key={k} className="inline-flex items-center gap-1 text-xs">
+                  <input type="radio" name="scopeMode" checked={scopeMode === k} onChange={() => setScopeMode(k)} className="rounded" />{l}
+                </label>)}
+            </div>
+          </div>
+          <div className="flex items-end">
+            <button onClick={() => loadData()} disabled={loading || !selectedCatalog || !selectedSchema || (scopeMode === 'table' && (!selectedTables.length || selectedTables.length > MAX_REVIEW_SELECTION))}
+              className="px-5 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 shadow-sm w-full">
+              {loading ? 'Loading...' : 'Load'}
+            </button>
+          </div>
+        </div>
+        {scopeMode === 'table' && (
+          <div className="pt-1">
+            <button type="button" onClick={() => setPasteOpen(o => !o)} className="text-xs text-blue-600 hover:underline">
+              {pasteOpen ? '− Hide paste box' : '+ Paste table names'}
+            </button>
+            {pasteOpen && (
+              <div className="mt-2 space-y-2">
+                <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} rows={3}
+                  className={inp + ' font-mono text-xs'}
+                  placeholder={'catalog.schema.table1, catalog.schema.table2\ncatalog.schema.table3   (comma- or newline-separated, fully-scoped)'}
+                  aria-label="Paste comma-delimited fully-scoped table names" />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button type="button" onClick={addPastedTables} disabled={!pasteText.trim()}
+                    className="px-3 py-1 bg-slate-700 text-white rounded-md text-xs font-medium hover:bg-slate-800 disabled:opacity-50">
+                    Add tables
+                  </button>
+                  <span className="text-xs text-slate-400">
+                    All tables must be in one schema; the Catalog/Schema selectors follow the pasted names. Added to the selection below (cap {MAX_REVIEW_SELECTION}).
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {scopeMode === 'table' && selectedSchema && (
+          <div>
+            <input value={tableFilter} onChange={e => setTableFilter(e.target.value)} placeholder="Filter tables..." className={inp + ' mb-2 max-w-xs'} aria-label="Filter tables" />
+            {filteredTables.length > 0 ? (
+              <>
+                <div className="flex gap-2 mb-1 text-xs">
+                  <button
+                    onClick={() => setSelectedTables(prev => {
+                      // Fill up to the cap with the first available filtered tables.
+                      const room = MAX_REVIEW_SELECTION - prev.length
+                      if (room <= 0) return prev
+                      const add = filteredTables.filter(t => !selectedTableSet.has(t)).slice(0, room)
+                      return [...prev, ...add]
+                    })}
+                    className="text-blue-600 hover:underline">
+                    Select first {MAX_REVIEW_SELECTION}
+                  </button>
+                  <button onClick={() => setSelectedTables([])} className="text-blue-600 hover:underline">Clear</button>
+                  <span className={`ml-auto ${atSelectionCap ? 'text-amber-600 dark:text-amber-400 font-medium' : 'text-slate-400'}`}>
+                    {selectedTables.length} / {MAX_REVIEW_SELECTION} selected
+                    {allSchemaTableCount > cst.tables.length && ` · ${cst.tables.length} of ${allSchemaTableCount} tables have generated metadata`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-1 max-h-36 overflow-y-auto border border-slate-200 rounded-md p-2">
+                  {filteredTables.slice(0, PICK_RENDER_CAP).map(t => {
+                    const checked = selectedTableSet.has(t)
+                    // At the cap, disable unchecked boxes so the limit is visible (not a silent no-op).
+                    const disabled = !checked && atSelectionCap
+                    return (
+                    <label key={t} className={`flex items-center gap-1.5 text-xs py-0.5 ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
+                      title={disabled ? `Selection is capped at ${MAX_REVIEW_SELECTION}` : t}>
+                      <input type="checkbox" checked={checked} disabled={disabled} onChange={() => toggleTable(t)} className="rounded" />{t}
+                    </label>)})}
+                </div>
+                {filteredTables.length > PICK_RENDER_CAP && (
+                  <p className="text-xs text-slate-400 mt-1">
+                    Showing first {PICK_RENDER_CAP} of {filteredTables.length} — type in the filter to find a specific table.
+                  </p>
+                )}
+                {atSelectionCap && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                    Selection is capped at {MAX_REVIEW_SELECTION} tables. Deselect some, or use <strong>Entire Schema</strong> mode to review a whole large schema.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-xs text-slate-500 dark:text-slate-400 py-1">
+                {tableFilter
+                  ? 'No tables match the filter.'
+                  : allSchemaTableCount > 0
+                    ? `None of the ${allSchemaTableCount} tables in this schema have generated metadata yet. Run the metadata generator on them first, then reload.`
+                    : 'No tables with generated metadata in this schema yet.'}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Metadata Type Filter + Review Status Filter */}
+      {reviewData.length > 0 && (
+        <>
+          <div className="text-[10px] text-slate-400 dark:text-slate-500 flex items-center gap-3 px-1">
+            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-full bg-green-400" /> Review status &amp; property roles save instantly</span>
+            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-full bg-amber-400" /> Comments &amp; classifications require Save Changes</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-slate-500">Show:</span>
+            {META_TYPES.map(({ key, label }) => (
+              <span key={key} onClick={() => setActiveType(key)} className={`${chip} ${activeType === key ? chipOn : chipOff}`}>{label}</span>
+            ))}
+            <span className="border-l border-slate-300 h-5 mx-1" />
+            <span className="text-xs font-medium text-slate-500">Status:</span>
+            {['all', 'unreviewed', 'in_review', 'approved'].map(s => (
+              <span key={s} onClick={() => setStatusFilter(s)} className={`${chip} ${statusFilter === s ? chipOn : chipOff}`}>
+                {s === 'all' ? 'All' : s === 'in_review' ? 'In Review' : s.charAt(0).toUpperCase() + s.slice(1)}
+              </span>
+            ))}
+            {totalDirty > 0 && (
+              <button onClick={saveChanges} disabled={saving}
+                title="Batch-saves all edited table comments/domains and column comments/classifications to the knowledge bases."
+                className="ml-auto px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 shadow-sm disabled:opacity-50">
+                {saving ? 'Saving...' : `Save Changes (${totalDirty})`}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Ontology context guide */}
+      {show('ontology') && reviewData.length > 0 && (
+        <div className="card px-4 py-3 text-xs text-slate-500 dark:text-slate-400 space-y-1 max-w-4xl">
+          <p className="font-medium text-slate-600 dark:text-slate-300">What you see when Ontology is selected</p>
+          <p>Each table shows three sections: <strong>Table Entity</strong> assigns the primary entity type (e.g. Patient, Order) as a UC tag on the table. <strong>Business Concepts</strong> lists all entity mappings for the table's columns, with per-entity confidence and an apply button. <strong>Column Properties</strong> classifies each column's role (identifier, measure, dimension, link, etc.) using a two-tier system: formal bundle definitions first, then heuristic fallback.</p>
+          <p>Property roles and review status save instantly. Tag application writes <code className="text-[10px]">entity_type</code>, <code className="text-[10px]">property_role</code>, and <code className="text-[10px]">linked_entity_type</code> as Unity Catalog tags.</p>
+        </div>
+      )}
+
+      {/* Global Ontology Apply Bar */}
+      {show('ontology') && reviewData.length > 0 && (() => {
+        const allSelections = reviewData.flatMap(tbl =>
+          (tbl.ontology_entities || [])
+            .filter(e => Number(e.confidence ?? 0) >= ontoConfThreshold)
+            .map(e => {
+              let sc = e.source_columns
+              if (typeof sc === 'string') { try { sc = JSON.parse(sc) } catch {} }
+              return { entity_type: entityTypeOverrides[e.entity_id] || e.entity_type, source_tables: [tbl.table_name], source_columns: Array.isArray(sc) ? sc : [], entity_role: e.entity_role || 'primary' }
+            })
+        )
+        return allSelections.length > 0 ? (
+          <div className="card p-4 flex flex-wrap items-center gap-3">
+            <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">Ontology Tags</span>
+            <label className="text-xs text-slate-500 flex items-center gap-1">
+              Min Confidence:
+              <input type="number" min="0" max="1" step="0.05" value={ontoConfThreshold}
+                onChange={ev => setOntoConfThreshold(Number(ev.target.value))}
+                className="text-xs border border-slate-300 rounded px-1.5 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200 w-16" />
+            </label>
+            <button onClick={async () => {
+              setGlobalOntoApplying(true); setGlobalOntoResult(null)
+              try {
+                const r = await fetch('/api/ontology/apply-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ selections: allSelections }) })
+                const j = await r.json().catch(() => ({}))
+                setGlobalOntoResult(r.ok ? j : { error: j.detail || j })
+              } catch (err) { setGlobalOntoResult({ error: err.message }) }
+              setGlobalOntoApplying(false)
+            }} disabled={globalOntoApplying}
+              className="px-4 py-1.5 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 disabled:opacity-50 shadow-sm">
+              {globalOntoApplying ? 'Applying...' : `Apply All Ontology Tags (${allSelections.length} entities, conf \u2265 ${ontoConfThreshold})`}
+            </button>
+            {globalOntoResult && (
+              <span className={`text-xs ${globalOntoResult.error ? 'text-red-600' : 'text-green-600'}`}>
+                {globalOntoResult.error
+                  ? String(typeof globalOntoResult.error === 'object' ? JSON.stringify(globalOntoResult.error) : globalOntoResult.error)
+                  : `Done: ${(globalOntoResult.results || []).filter(r => r.ok).length} table tags, ${(globalOntoResult.column_results || []).filter(r => r.ok).length} column tags applied`}
+              </span>
+            )}
+          </div>
+        ) : null
+      })()}
+
+      {/* Global FK Tag All Bar */}
+      {show('fk') && reviewData.length > 0 && (() => {
+        const allFkPreds = reviewData.flatMap(tbl =>
+          (tbl.fk_predictions || [])
+            .filter(fk => Number(fk.final_confidence ?? 0) >= fkConfThreshold)
+            .map(fk => ({
+              src_table: fk.src_table, src_column: fk.src_column,
+              dst_table: fk.dst_table, dst_column: fk.dst_column,
+            }))
+        )
+        return allFkPreds.length > 0 ? (
+          <>
+            <div className="card p-4 flex flex-wrap items-center gap-3">
+              <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">FK Tags</span>
+              <label className="text-xs text-slate-500 flex items-center gap-1">
+                Min Confidence:
+                <input type="number" min="0" max="1" step="0.05" value={fkConfThreshold}
+                  onChange={ev => setFkConfThreshold(Number(ev.target.value))}
+                  className="text-xs border border-slate-300 rounded px-1.5 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200 w-16" />
+              </label>
+              <button onClick={async () => {
+                setGlobalFkTagApplying(true); setGlobalFkTagResult(null)
+                try {
+                  const r = await fetch('/api/analytics/fk-apply-as-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predictions: allFkPreds }) })
+                  const j = await r.json().catch(() => ({}))
+                  setGlobalFkTagResult(r.ok ? j : { error: j.detail || j })
+                } catch (err) { setGlobalFkTagResult({ error: err.message }) }
+                setGlobalFkTagApplying(false)
+              }} disabled={globalFkTagApplying}
+                className="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 shadow-sm"
+                title="Only requires APPLY_TAG permission">
+                {globalFkTagApplying ? 'Tagging...' : `Tag All (${allFkPreds.length} pairs, conf \u2265 ${fkConfThreshold})`}
+              </button>
+              <button onClick={async () => {
+                try {
+                  const r = await fetch('/api/analytics/fk-generate-sql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predictions: allFkPreds }) })
+                  const j = await r.json().catch(() => ({}))
+                  setFkGenSql(r.ok ? (j.sql || '') : `-- Error: ${j.detail || 'Server error'}`)
+                } catch (err) { setFkGenSql(`-- Error: ${err.message}`) }
+              }} className="px-4 py-1.5 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 shadow-sm"
+                title="Generate ALTER TABLE ADD CONSTRAINT DDL (requires MANAGE to execute)">
+                Generate SQL ({allFkPreds.length})
+              </button>
+              {globalFkTagResult && (
+                <span className={`text-xs ${globalFkTagResult.error ? 'text-red-600' : 'text-green-600'}`}>
+                  {globalFkTagResult.error
+                    ? String(typeof globalFkTagResult.error === 'object' ? JSON.stringify(globalFkTagResult.error) : globalFkTagResult.error)
+                    : `Done: ${(globalFkTagResult.results || []).filter(r => r.ok).length} tagged, ${(globalFkTagResult.results || []).filter(r => !r.ok).length} failed`}
+                </span>
+              )}
+            </div>
+            {fkGenSql != null && (
+              <div className="card p-3 relative border border-slate-300 dark:border-dbx-navy-400/40">
+                <pre className="text-[11px] bg-slate-800 dark:bg-slate-900 text-green-300 dark:text-green-400 rounded p-3 overflow-x-auto whitespace-pre-wrap max-h-60 font-mono">{fkGenSql}</pre>
+                <div className="absolute top-2 right-2 flex gap-1">
+                  <button onClick={() => { navigator.clipboard.writeText(fkGenSql) }}
+                    className="text-[10px] px-2 py-0.5 bg-slate-700 border border-slate-600 rounded hover:bg-slate-600 text-slate-200">Copy</button>
+                  <button onClick={() => setFkGenSql(null)}
+                    className="text-[10px] px-2 py-0.5 bg-slate-700 border border-slate-600 rounded hover:bg-slate-600 text-slate-200">Close</button>
+                </div>
+              </div>
+            )}
+          </>
+        ) : null
+      })()}
+
+      {/* Result Filters */}
+      {reviewData.length > 0 && (
+        <div className="card p-3 flex flex-wrap items-center gap-3">
+          <input value={resultFilter} onChange={e => setResultFilter(e.target.value)}
+            placeholder="Search tables..." className={inp + ' !w-56 !py-1.5 !text-xs'} aria-label="Filter loaded tables by name" />
+          {resultSchemas.length > 1 && (
+            <select value={resultSchemaFilter} onChange={e => setResultSchemaFilter(e.target.value)}
+              className={inp + ' !w-auto !py-1.5 !text-xs'}>
+              <option value="">All schemas ({resultSchemas.length})</option>
+              {resultSchemas.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          )}
+          <span className="text-xs text-slate-400 ml-auto">
+            {visibleReview.length === reviewData.length
+              ? `${reviewData.length} tables`
+              : `${visibleReview.length} of ${reviewData.length} tables`}
+          </span>
+          <button onClick={() => {
+            const allExpanded = visibleReview.every(t => expanded[t.table_name])
+            if (allExpanded) { setExpanded({}) }
+            else { const exp = { ...expanded }; visibleReview.forEach(t => { exp[t.table_name] = true }); setExpanded(exp) }
+          }} className="text-xs text-blue-600 dark:text-blue-400 hover:underline">
+            {visibleReview.every(t => expanded[t.table_name]) ? 'Collapse All' : 'Expand All'}
+          </button>
+          {(resultFilter || resultSchemaFilter) && (
+            <button onClick={() => { setResultFilter(''); setResultSchemaFilter('') }}
+              className="text-xs text-blue-600 dark:text-blue-400 hover:underline">Clear filters</button>
+          )}
+          {/* Server-side pagination: only when the scope has more than one page. */}
+          {reviewTotal > REVIEW_PAGE_SIZE && (
+            <div className="flex items-center gap-2 text-xs">
+              <button onClick={() => loadData(Math.max(0, reviewOffset - REVIEW_PAGE_SIZE))}
+                disabled={reviewOffset === 0 || loading}
+                className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-50 dark:hover:bg-dbx-navy-500">Prev</button>
+              <span className="text-slate-400">{reviewOffset + 1}–{reviewOffset + reviewData.length} of {reviewTotal}</span>
+              <button onClick={() => loadData(reviewOffset + REVIEW_PAGE_SIZE)}
+                disabled={!reviewHasMore || loading}
+                className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-50 dark:hover:bg-dbx-navy-500">Next</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Combined Data View */}
+      {reviewData.length > 0 && (
+        <div className="space-y-3">
+          {visibleReview.length > pageSize && pageSize > 0 && (
+            <div className="flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex items-center gap-2">
+                <span>Show</span>
+                <select value={pageSize} onChange={e => setPageSize(Number(e.target.value))} className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-1.5 py-0.5 text-xs bg-white dark:bg-dbx-navy/60 dark:text-slate-200">
+                  {[10, 25, 50].map(n => <option key={n} value={n}>{n}</option>)}
+                  <option value={0}>All</option>
+                </select>
+                <span>per page</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button disabled={page === 0} onClick={() => setPage(p => p - 1)} className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-dbx-navy-500/50">&lsaquo; Prev</button>
+                <span>Page {page + 1} of {totalPages}</span>
+                <button disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)} className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-dbx-navy-500/50">Next &rsaquo;</button>
+              </div>
+            </div>
+          )}
+          {paginatedReview.map((tbl, _fi) => {
+            const tblIdx = reviewData.indexOf(tbl)
+            return (
+            <div key={tbl.table_name} className="bg-dbx-oat-light dark:bg-dbx-navy-650 rounded-xl border border-slate-200 dark:border-dbx-navy-400/25 shadow-sm overflow-hidden">
+              {/* Table header row */}
+              <div className={`flex items-center gap-2 px-4 py-2.5 cursor-pointer select-none flex-wrap ${isTableDirty(tblIdx) ? 'bg-amber-50 dark:bg-amber-900/20' : 'bg-dbx-oat dark:bg-dbx-navy-500/50'}`}
+                onClick={() => setExpanded(p => ({ ...p, [tbl.table_name]: !p[tbl.table_name] }))}>
+                <span className="text-xs text-slate-400">{expanded[tbl.table_name] ? '\u25BC' : '\u25B6'}</span>
+                <span className="font-semibold text-sm text-slate-700 dark:text-slate-200">{tbl.table_name}</span>
+                {tbl.domain && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 font-medium">{tbl.domain}{tbl.subdomain ? ` / ${tbl.subdomain}` : ''}</span>}
+                {tbl.primary_entity && (<span className="inline-flex items-center gap-1">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300 font-medium">{tbl.primary_entity.entity_type} ({Number(tbl.primary_entity.confidence ?? 0).toFixed(2)})</span>
+                  {tbl.primary_entity.source_ontology && <span className="text-[9px] px-1 py-0 rounded bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300">{tbl.primary_entity.source_ontology}</span>}
+                </span>)}
+                {show('ontology') && (() => {
+                  const rs = tbl.review_status || 'unreviewed'
+                  const rsCls = rs === 'approved' ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300' : rs === 'in_review' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800/40 dark:text-slate-400'
+                  return (
+                    <select value={rs} title="Saves immediately to table_knowledge_base. Tracks whether a human has reviewed this table's ontology metadata." onClick={ev => ev.stopPropagation()} onChange={ev => {
+                      ev.stopPropagation()
+                      const newStatus = ev.target.value
+                      const sel = ev.target
+                      setReviewData(prev => prev.map((t, i) => i === tblIdx ? { ...t, review_status: newStatus } : t))
+                      fetch('/api/ontology/set-review-status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ table_name: tbl.table_name, review_status: newStatus }) })
+                        .then(r => { sel.style.outline = r.ok ? '2px solid #22c55e' : '2px solid #ef4444'; setTimeout(() => { sel.style.outline = '' }, 1200) })
+                        .catch(() => { sel.style.outline = '2px solid #ef4444'; setTimeout(() => { sel.style.outline = '' }, 1200) })
+                    }} className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium border-0 cursor-pointer ${rsCls}`}>
+                      <option value="unreviewed">unreviewed</option>
+                      <option value="in_review">in review</option>
+                      <option value="approved">approved</option>
+                    </select>
+                  )
+                })()}
+                <span className="text-xs text-slate-400 ml-auto">{tbl.columns?.length || 0} columns</span>
+              </div>
+
+              {expanded[tbl.table_name] && (
+                <div className="px-4 pb-4 space-y-1">
+                  {/* Table-level fields */}
+                  <details open className="group/tbl">
+                    <summary className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide cursor-pointer select-none py-2 hover:text-slate-700 dark:hover:text-slate-200">
+                      Table Properties
+                    </summary>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1 pb-2">
+                    {show('comments') && (
+                      <div className="col-span-4">
+                        <label className="block text-xs font-medium text-slate-500 mb-1">Table Comment</label>
+                        <textarea value={tbl.comment ?? ''} onChange={e => onTableChange(tblIdx, 'comment', e.target.value)} rows={2}
+                          className={inp + ' resize-y'} />
+                      </div>
+                    )}
+                    {show('domain') && (
+                      <>
+                        <div className="col-span-2"><label className="block text-xs font-medium text-slate-500 mb-1">Domain</label>
+                          <input value={tbl.domain ?? ''} onChange={e => onTableChange(tblIdx, 'domain', e.target.value)} className={inp} /></div>
+                        <div className="col-span-2"><label className="block text-xs font-medium text-slate-500 mb-1">Subdomain</label>
+                          <input value={tbl.subdomain ?? ''} onChange={e => onTableChange(tblIdx, 'subdomain', e.target.value)} className={inp} /></div>
+                      </>
+                    )}
+                    {show('pii') && (
+                      <>
+                        <div className="flex items-center gap-2"><input type="checkbox" checked={tbl.has_pii === true} onChange={() => onTableCheckbox(tblIdx, 'has_pii')} className="rounded" aria-label="Mark table as having PII" />
+                          <span className="text-xs text-slate-600">Has PII</span></div>
+                        <div className="flex items-center gap-2"><input type="checkbox" checked={tbl.has_phi === true} onChange={() => onTableCheckbox(tblIdx, 'has_phi')} className="rounded" aria-label="Mark table as having PHI" />
+                          <span className="text-xs text-slate-600">Has PHI</span></div>
+                      </>
+                    )}
+                  </div>
+                  </details>
+
+                  {/* Column rows */}
+                  {(show('comments') || show('pii') || show('ontology')) && tbl.columns?.length > 0 && (
+                  <details open className="group/cols">
+                    <summary className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide cursor-pointer select-none py-2 hover:text-slate-700 dark:hover:text-slate-200">
+                      Columns ({tbl.columns.length})
+                    </summary>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-sm table-fixed">
+                        <thead><tr className="bg-dbx-oat/50 dark:bg-dbx-navy-500/50">
+                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase w-40">Column</th>
+                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase w-24">Type</th>
+                          {show('comments') && <th title="Edits saved in batch via Save Changes to column_knowledge_base" className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase">Comment</th>}
+                          {show('pii') && <th title="Edits saved in batch via Save Changes to column_knowledge_base" className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase">Classification</th>}
+                          {show('pii') && <th title="Edits saved in batch via Save Changes to column_knowledge_base" className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase">Class. Type</th>}
+                          {show('ontology') && <th className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase">Entity Types</th>}
+                          {show('ontology') && <th title="Saves immediately to ontology_column_properties" className="text-left px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase">Property Role</th>}
+                        </tr></thead>
+                        <tbody>
+                          {(() => {
+                            // Precompute per-table lookups ONCE instead of per-column:
+                            // colProp by column_name, and entities keyed by each
+                            // source column (parsing source_columns JSON a single time).
+                            const colPropByName = {}
+                            for (const p of (tbl.column_properties || [])) colPropByName[p.column_name] = p
+                            const entsByCol = {}
+                            for (const e of (tbl.ontology_entities || [])) {
+                              let sc = e.source_columns
+                              if (typeof sc === 'string') { try { sc = JSON.parse(sc) } catch { sc = [] } }
+                              if (Array.isArray(sc)) for (const cn of sc) (entsByCol[cn] = entsByCol[cn] || []).push(e)
+                            }
+                            const showAllCols = colsShowAll[tbl.table_name]
+                            const renderCols = showAllCols ? tbl.columns : tbl.columns.slice(0, COL_RENDER_CAP)
+                            return renderCols.map((col, ci) => {
+                            const colProp = colPropByName[col.column_name]
+                            return (
+                            <tr key={col.column_id || ci} className={`border-b border-slate-100 dark:border-dbx-navy-400/20 ${isColDirty(tblIdx, ci) ? 'bg-amber-50 dark:bg-amber-900/20' : ''} hover:bg-orange-50/30 dark:hover:bg-dbx-navy-500/30`}>
+                              <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300 font-mono text-xs truncate">{col.column_name}</td>
+                              <td className="px-3 py-1.5 text-slate-400 dark:text-slate-500 text-xs truncate">{col.data_type}</td>
+                              {show('comments') && <td className="px-2 py-1"><textarea value={col.comment ?? ''} onChange={e => onColChange(tblIdx, ci, 'comment', e.target.value)} rows={2} className={inp + ' resize-y whitespace-pre-wrap break-words'} /></td>}
+                              {show('pii') && <td className="px-2 py-1">
+                                <div className="flex items-center gap-1.5">
+                                  <input value={col.classification ?? ''} onChange={e => onColChange(tblIdx, ci, 'classification', e.target.value)} className={inp} placeholder="Unclassified" />
+                                  {(() => { const b = classLabel(col.classification); return <span className={`whitespace-nowrap text-[10px] px-1.5 py-0.5 rounded-full font-medium ${b.cls}`}>{b.text}</span> })()}
+                                </div>
+                              </td>}
+                              {show('pii') && <td className="px-2 py-1"><input value={col.classification_type ?? ''} onChange={e => onColChange(tblIdx, ci, 'classification_type', e.target.value)} className={inp} /></td>}
+                              {show('ontology') && <td className="px-2 py-1">{(() => {
+                                const ents = entsByCol[col.column_name] || []
+                                return ents.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1">{ents.map((e, ei) => {
+                                    const c = Number(e.confidence ?? 0)
+                                    const role = e.entity_role || 'primary'
+                                    const cls = role === 'primary' ? 'bg-purple-100 text-purple-700' : c <= 0 ? 'bg-red-100 text-red-700' : c < 0.5 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'
+                                    return (<span key={ei} className="inline-flex items-center gap-1">
+                                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${cls}`}>{e.entity_type} ({c.toFixed(2)})</span>
+                                      {e.source_ontology && <span className="text-[9px] px-1 py-0 rounded bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300">{e.source_ontology}</span>}
+                                    </span>)
+                                  })}</div>
+                                ) : <span className="text-[10px] text-slate-300">--</span>
+                              })()}</td>}
+                              {show('ontology') && <td className="px-2 py-1">{colProp ? (() => {
+                                const cpKey = colProp.property_id
+                                const rawRole = colPropOverrides[cpKey]?.property_role ?? colProp.property_role
+                                const curRole = (rawRole && LEGACY_ROLE_MAP[rawRole]) ?? rawRole
+                                const curLinked = colPropOverrides[cpKey]?.linked_entity_type ?? colProp.linked_entity_type ?? ''
+                                return (
+                                  <div className="flex items-center gap-1">
+                                    <select value={curRole ?? ''} title="Saves immediately to ontology_column_properties. Defines how this column is used (grouping, aggregation, joining, etc.)." onChange={ev => {
+                                      const nr = ev.target.value
+                                      setColPropOverrides(p => ({ ...p, [cpKey]: { ...(p[cpKey] || {}), property_role: nr } }))
+                                      fetch('/api/ontology/update-column-property', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ property_id: cpKey, property_role: nr, linked_entity_type: curLinked || null }) })
+                                        .then(r => { if (!r.ok) setError('Failed to save property role') })
+                                        .catch(() => setError('Failed to save property role — check connection'))
+                                    }} className="text-[10px] border border-slate-300 dark:border-dbx-navy-400/40 rounded px-1 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200">
+                                      <option value="">Select role...</option>
+                                      {PROPERTY_ROLE_GROUPS.map(group => (
+                                        <optgroup key={group.label} label={group.label}>
+                                          {group.roles.map(role => (
+                                            <option key={role} value={role}>{role.replace(/_/g, ' ')}</option>
+                                          ))}
+                                        </optgroup>
+                                      ))}
+                                    </select>
+                                    {curRole === 'object_property' && (
+                                      <input value={curLinked} placeholder="linked entity"
+                                        onChange={ev => setColPropOverrides(p => ({ ...p, [cpKey]: { ...(p[cpKey] || {}), linked_entity_type: ev.target.value } }))}
+                                        onBlur={ev => {
+                                          fetch('/api/ontology/update-column-property', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ property_id: cpKey, property_role: curRole, linked_entity_type: ev.target.value || null }) }).catch(() => {})
+                                        }}
+                                        className="text-[10px] border border-slate-300 dark:border-dbx-navy-400/40 rounded px-1 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200 w-20" />
+                                    )}
+                                  </div>
+                                )
+                              })() : <span className="text-[10px] text-slate-300">--</span>}</td>}
+                            </tr>
+                          )})
+                          })()}
+                          {tbl.columns.length > COL_RENDER_CAP && !colsShowAll[tbl.table_name] && (
+                            <tr><td colSpan={6} className="px-3 py-2 text-center">
+                              <button onClick={() => setColsShowAll(p => ({ ...p, [tbl.table_name]: true }))}
+                                className="text-xs text-blue-600 dark:text-blue-400 hover:underline">
+                                Show all {tbl.columns.length} columns (showing first {COL_RENDER_CAP})
+                              </button>
+                            </td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                  )}
+
+                  {/* ═══ ZONE 1: Table Entity ═══ */}
+                  {show('ontology') && (
+                    <div className="border-t border-slate-200 dark:border-dbx-navy-400/30 pt-3 mt-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider flex items-center">
+                          Table Entity{tbl.primary_entity ? ` \u2014 ${tbl.primary_entity.entity_type}` : ''}
+                          <Tip text="Applies the primary entity as an entity_type tag on the table itself. Does not affect columns. Also saved to the knowledge base." />
+                        </h4>
+                        {tbl.primary_entity && (
+                          <button onClick={async () => {
+                            setTableTagApplying(p => ({ ...p, [tbl.table_name]: true }))
+                            const et = tbl.primary_entity.entity_type
+                            try {
+                              const r = await fetch('/api/ontology/apply-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ selections: [{ entity_type: et, source_tables: [tbl.table_name], source_columns: [], entity_role: 'primary' }] }) })
+                              const j = await r.json().catch(() => ({}))
+                              setTableTagResults(p => ({ ...p, [tbl.table_name]: j }))
+                            } catch (err) { setTableTagResults(p => ({ ...p, [tbl.table_name]: { error: err.message } })) }
+                            setTableTagApplying(p => ({ ...p, [tbl.table_name]: false }))
+                          }} disabled={tableTagApplying[tbl.table_name]}
+                            className="text-[10px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 font-medium">
+                            {tableTagApplying[tbl.table_name] ? 'Applying...' : 'Apply Table Entity Tag'}
+                          </button>
+                        )}
+                      </div>
+                      {tbl.primary_entity && (
+                        <div className="flex items-center gap-2 px-3 py-2 bg-purple-100 dark:bg-purple-900/30 border border-purple-300 dark:border-purple-700/50 rounded-lg">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-purple-500 dark:text-purple-400">Primary Entity</span>
+                          <span className="text-sm font-semibold text-purple-800 dark:text-purple-200">{tbl.primary_entity.entity_type}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${Number(tbl.primary_entity.confidence ?? 0) > 0 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                            {Number(tbl.primary_entity.confidence ?? 0).toFixed(2)}
+                          </span>
+                          {(tbl.primary_entity.validated === true || tbl.primary_entity.validated === 'true') && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700">validated</span>
+                          )}
+                        </div>
+                      )}
+                      {tableTagResults[tbl.table_name] && (() => {
+                        const ar = tableTagResults[tbl.table_name]
+                        if (ar.error) return <div className="text-xs text-red-600">{String(ar.error)}</div>
+                        const ok = (ar.results || []).filter(r => r.ok)
+                        const fail = (ar.results || []).filter(r => !r.ok)
+                        return (
+                          <div className="text-xs space-y-0.5">
+                            {ok.length > 0 && <div className="text-green-600">Table tag applied.{ok.map(r => r.verified ? ` [${r.verified}]` : '').join('')}</div>}
+                            {fail.map((r, ri) => <div key={ri} className="text-red-600">{r.error || 'unknown error'}</div>)}
+                          </div>
+                        )
+                      })()}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Override Primary:</span>
+                        <input value={recommendedEntity[tbl.table_name] || ''} placeholder="e.g. OrderLineItem"
+                          onChange={ev => setRecommendedEntity(p => ({ ...p, [tbl.table_name]: ev.target.value }))}
+                          className="text-xs border border-purple-300 dark:border-purple-700/50 rounded px-2 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200 w-40" />
+                        <button onClick={async () => {
+                          const et = (recommendedEntity[tbl.table_name] || '').trim()
+                          if (!et) return
+                          setRecEntLoading(p => ({ ...p, [tbl.table_name]: true }))
+                          try {
+                            const r = await fetch('/api/ontology/set-recommended-entity', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ table_name: tbl.table_name, entity_type: et }) })
+                            if (r.ok) { setRecommendedEntity(p => ({ ...p, [tbl.table_name]: '' })); loadData() }
+                          } catch {}
+                          setRecEntLoading(p => ({ ...p, [tbl.table_name]: false }))
+                        }} disabled={recEntLoading[tbl.table_name] || !(recommendedEntity[tbl.table_name] || '').trim()}
+                          className="text-[10px] px-2 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50">
+                          {recEntLoading[tbl.table_name] ? '...' : 'Set as Primary'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ═══ ZONE 2: Business Concepts ═══ */}
+                  {show('ontology') && (
+                    <div className="border-t border-slate-200 dark:border-dbx-navy-400/30 pt-3 mt-3 space-y-2">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <h4 className="text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider flex items-center">
+                          Business Concepts
+                          {Array.isArray(tbl.ontology_entities) && (() => {
+                            const total = tbl.ontology_entities.length
+                            const above = tbl.ontology_entities.filter(e => Number(e.confidence ?? 0) >= ontoConfThreshold).length
+                            return total > 0 ? <span className="ml-1.5 text-slate-400 font-normal normal-case">{total} entities ({above} above threshold)</span> : null
+                          })()}
+                          <Tip text="Applies entity_type tags to the specific columns listed in each entity's source_columns. Individual Apply buttons bypass the confidence threshold." />
+                        </h4>
+                        <div className="flex items-center gap-2">
+                          <label className="text-[10px] text-slate-500">Min Confidence:</label>
+                          <input type="number" min="0" max="1" step="0.05" value={ontoConfThreshold}
+                            onChange={ev => setOntoConfThreshold(Number(ev.target.value))}
+                            className="text-[10px] border border-slate-300 rounded px-1.5 py-0.5 bg-white w-16" />
+                          {Array.isArray(tbl.ontology_entities) && tbl.ontology_entities.filter(e => Number(e.confidence ?? 0) >= ontoConfThreshold).length > 0 && (
+                            <button onClick={async () => {
+                              setOntoApplying(p => ({ ...p, [tbl.table_name]: true })); setOntoApplyResults(p => ({ ...p, [tbl.table_name]: null }))
+                              const selections = tbl.ontology_entities.filter(e => Number(e.confidence ?? 0) >= ontoConfThreshold).map(e => {
+                                let sc = e.source_columns
+                                if (typeof sc === 'string') { try { sc = JSON.parse(sc) } catch {} }
+                                return { entity_type: entityTypeOverrides[e.entity_id] || e.entity_type, source_tables: [tbl.table_name], source_columns: Array.isArray(sc) ? sc : [], entity_role: e.entity_role || 'primary' }
+                              })
+                              try {
+                                const r = await fetch('/api/ontology/apply-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ selections }) })
+                                const j = await r.json().catch(() => ({}))
+                                setOntoApplyResults(p => ({ ...p, [tbl.table_name]: j }))
+                              } catch (err) { setOntoApplyResults(p => ({ ...p, [tbl.table_name]: { error: err.message } })) }
+                              setOntoApplying(p => ({ ...p, [tbl.table_name]: false }))
+                            }} disabled={ontoApplying[tbl.table_name]}
+                              className="text-[10px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 font-medium">
+                              {ontoApplying[tbl.table_name] ? 'Applying...' : `Apply All (conf \u2265 ${ontoConfThreshold})`}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {ontoApplyResults[tbl.table_name] && (() => {
+                        const ar = ontoApplyResults[tbl.table_name]
+                        if (ar.error) return <div className="text-xs text-red-600">{String(ar.error)}</div>
+                        const tblOk = (ar.results || []).filter(r => r.ok)
+                        const tblFail = (ar.results || []).filter(r => !r.ok)
+                        const colOk = (ar.column_results || []).filter(r => r.ok)
+                        const colFail = (ar.column_results || []).filter(r => !r.ok)
+                        const allSql = [...(ar.results || []), ...(ar.column_results || [])].map(r => r.sql).filter(Boolean)
+                        const allFail = [...tblFail, ...colFail]
+                        return (
+                          <div className="text-xs space-y-1">
+                            {tblOk.length > 0 && <div className="text-green-600">Table: {tblOk.length} tag(s) verified.{tblOk.map(r => r.verified ? ` [${r.verified}]` : '').join('')}</div>}
+                            {colOk.length > 0 && <div className="text-green-600">Columns: {colOk.length} tag(s) verified.{colOk.map(r => ` ${r.column}=[${r.verified}]`).join(',')}</div>}
+                            {allFail.length > 0 && allFail.map((r, ri) => (
+                              <div key={ri} className="text-red-600">{r.column ? `${r.table}.${r.column}` : r.table}: {r.error || 'unknown error'}</div>
+                            ))}
+                            {allSql.length > 0 && (
+                              <details className="text-slate-500"><summary className="cursor-pointer">SQL details</summary>
+                                <pre className="mt-1 text-[10px] bg-slate-100 p-1 rounded overflow-x-auto whitespace-pre-wrap">{allSql.join('\n')}</pre>
+                              </details>
+                            )}
+                            {allFail.some(r => /PERMISSION_DENIED/i.test(r.error || '')) && (
+                              <span className="block text-orange-600">Tag permission denied -- try using a custom tag key or check governed tag policies.</span>
+                            )}
+                          </div>
+                        )
+                      })()}
+                      <details className="text-xs">
+                        <summary className="cursor-pointer text-purple-600 hover:text-purple-800 font-medium">+ Add Entity Mapping</summary>
+                        <div className="mt-1 flex items-center gap-2 flex-wrap p-2 bg-purple-50 dark:bg-purple-900/20 rounded border border-purple-200 dark:border-purple-700/40">
+                          <input placeholder="Entity type" id={`add-ent-type-${tblIdx}`} className="text-xs border border-purple-300 rounded px-2 py-0.5 w-32 dark:bg-dbx-navy/60 dark:text-slate-200" />
+                          <input placeholder="Source columns (comma-sep)" id={`add-ent-cols-${tblIdx}`} className="text-xs border border-purple-300 rounded px-2 py-0.5 w-48 dark:bg-dbx-navy/60 dark:text-slate-200" />
+                          <button onClick={async () => {
+                            const etEl = document.getElementById(`add-ent-type-${tblIdx}`)
+                            const colsEl = document.getElementById(`add-ent-cols-${tblIdx}`)
+                            const et = (etEl?.value || '').trim()
+                            if (!et) return
+                            const cols = (colsEl?.value || '').split(',').map(c => c.trim()).filter(Boolean)
+                            try {
+                              await fetch('/api/ontology/entity-add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ entity_type: et, table_name: tbl.table_name, source_columns: cols.length ? cols : null }) })
+                              etEl.value = ''; colsEl.value = ''
+                              loadData()
+                            } catch {}
+                          }} className="text-[10px] px-2 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700">Add</button>
+                        </div>
+                      </details>
+                      {!Array.isArray(tbl.ontology_entities) ? (
+                        <p className="text-xs text-slate-400 italic">Ontology data not available for this table.</p>
+                      ) : tbl.ontology_entities.length === 0 ? (
+                        <p className="text-xs text-slate-400 italic">No ontology entities mapped to this table.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {tbl.ontology_entities.map((e, i) => {
+                            const conf = Number(e.confidence ?? 0)
+                            const role = e.entity_role || 'primary'
+                            const isPrimary = role === 'primary'
+                            const confCls = conf <= 0 ? 'bg-red-100 text-red-700' : conf < 0.5 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'
+                            const eid = e.entity_id || `${tblIdx}-${i}`
+                            const isOpen = expandedEntities[eid]
+                            const srcCols = (() => {
+                              if (Array.isArray(e.source_columns)) return e.source_columns
+                              if (typeof e.source_columns === 'string') { try { const p = JSON.parse(e.source_columns); if (Array.isArray(p)) return p } catch {} }
+                              return []
+                            })()
+                            return (
+                              <div key={eid} className={`border rounded-lg ${isPrimary ? 'border-purple-300 bg-purple-50 dark:border-purple-700/50 dark:bg-purple-900/20' : 'border-slate-200 bg-slate-50/50 dark:border-dbx-navy-400/30 dark:bg-dbx-navy-500/30'}`}>
+                                <div className="flex items-center gap-2 px-3 py-1.5 cursor-pointer flex-wrap" onClick={() => setExpandedEntities(p => ({ ...p, [eid]: !p[eid] }))}>
+                                  <span className="text-xs text-slate-400">{isOpen ? '\u25BC' : '\u25B6'}</span>
+                                  <span className={`text-[9px] px-1 py-0.5 rounded font-bold uppercase tracking-wider ${isPrimary ? 'bg-purple-200 text-purple-700' : 'bg-slate-200 text-slate-500'}`}>
+                                    {role}
+                                  </span>
+                                  {e.entity_id ? (
+                                    <>
+                                      <input list={`eto-${eid}`} value={entityTypeOverrides[e.entity_id] ?? e.entity_type}
+                                        onClick={ev => ev.stopPropagation()}
+                                        onChange={ev => setEntityTypeOverrides(p => ({ ...p, [e.entity_id]: ev.target.value }))}
+                                        onBlur={ev => {
+                                          const val = (ev.target.value || '').trim()
+                                          if (val && val !== e.entity_type) {
+                                            fetch('/api/ontology/update-entity-type', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ entity_id: e.entity_id, new_entity_type: val }) }).catch(() => {})
+                                          }
+                                        }}
+                                        className="text-xs border border-purple-300 dark:border-purple-700/50 rounded px-1.5 py-0.5 bg-white dark:bg-dbx-navy/60 dark:text-slate-200 w-28" />
+                                      <datalist id={`eto-${eid}`}>
+                                        {entityTypeOptions.map(t => <option key={t} value={t} />)}
+                                      </datalist>
+                                    </>
+                                  ) : (
+                                    <span className="text-xs font-medium text-purple-700">{e.entity_type}</span>
+                                  )}
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${confCls}`}
+                                    title="Negative confidence means the AI validator rejected this entity mapping.">
+                                    {conf.toFixed(2)}
+                                  </span>
+                                  {e.validated !== undefined && (() => {
+                                    const isValidated = e.validated === true || e.validated === 'true'
+                                    const isRejected = isValidated && (e.validation_notes || '').startsWith('REJECTED')
+                                    const cls = isRejected ? 'bg-red-100 text-red-700' : isValidated ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500'
+                                    const label = isRejected ? 'rejected' : isValidated ? 'approved' : 'unreviewed'
+                                    return <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${cls}`}>{label}</span>
+                                  })()}
+                                  {srcCols.length > 0 && (
+                                    <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                                      {srcCols.map((c, ci) => <code key={ci} className="bg-white/80 dark:bg-dbx-navy/40 border border-slate-200 dark:border-dbx-navy-400/30 rounded px-1 py-0.5 text-slate-600 dark:text-slate-300 mr-1">{c}</code>)}
+                                    </span>
+                                  )}
+                                  <span className="ml-auto flex items-center gap-1">
+                                    {e.entity_id && (
+                                      <>
+                                        <button onClick={async (ev) => {
+                                          ev.stopPropagation()
+                                          try {
+                                            await fetch('/api/ontology/entity-review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ entity_id: e.entity_id, validated: true, validation_notes: 'Approved' }) })
+                                            loadData()
+                                          } catch {}
+                                        }} title="Approve this mapping" className="text-[10px] px-1.5 py-0.5 bg-green-600 text-white rounded hover:bg-green-700">Approve</button>
+                                        <button onClick={async (ev) => {
+                                          ev.stopPropagation()
+                                          try {
+                                            await fetch('/api/ontology/entity-review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ entity_id: e.entity_id, validated: false, validation_notes: 'REJECTED: User rejected' }) })
+                                            loadData()
+                                          } catch {}
+                                        }} title="Reject this mapping (prevents re-discovery)" className="text-[10px] px-1.5 py-0.5 bg-orange-500 text-white rounded hover:bg-orange-600">Reject</button>
+                                        <button onClick={async (ev) => {
+                                          ev.stopPropagation()
+                                          if (!confirm('Delete this entity mapping?')) return
+                                          try {
+                                            await fetch(`/api/ontology/entity/${encodeURIComponent(e.entity_id)}`, { method: 'DELETE' })
+                                            loadData()
+                                          } catch {}
+                                        }} title="Delete this entity mapping" className="text-[10px] px-1.5 py-0.5 bg-red-500 text-white rounded hover:bg-red-600">Del</button>
+                                      </>
+                                    )}
+                                    <button onClick={async (ev) => {
+                                      ev.stopPropagation()
+                                      const et = entityTypeOverrides[e.entity_id] || e.entity_type
+                                      try {
+                                        const r = await fetch('/api/ontology/apply-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                          body: JSON.stringify({ selections: [{ entity_type: et, source_tables: [tbl.table_name], source_columns: srcCols, entity_role: role }] }) })
+                                        const j = await r.json().catch(() => ({}))
+                                        setOntoApplyResults(p => ({ ...p, [tbl.table_name]: j }))
+                                      } catch (err) { setOntoApplyResults(p => ({ ...p, [tbl.table_name]: { error: err.message } })) }
+                                    }} className="text-[10px] px-1.5 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700"
+                                      title={isPrimary ? 'Apply entity_type tag to table and columns (ignores threshold)' : 'Apply entity_type tag to columns only (ignores threshold)'}>
+                                      Apply Tag
+                                    </button>
+                                  </span>
+                                </div>
+                                {isOpen && e.validation_notes && (
+                                  <div className="px-3 pb-2 border-t border-purple-200 dark:border-purple-700/30 mt-0">
+                                    <div className="mt-1.5">
+                                      <span className="text-[10px] font-semibold text-slate-500 dark:text-slate-400">Validation Notes:</span>
+                                      <p className="text-xs text-slate-600 dark:text-slate-300 italic bg-white/60 dark:bg-dbx-navy/40 rounded p-1.5 mt-0.5">{e.validation_notes}</p>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ═══ ZONE 3: Column Properties ═══ */}
+                  {show('ontology') && (tbl.column_properties || []).length > 0 && (
+                    <div className="border-t border-slate-200 dark:border-dbx-navy-400/30 pt-3 mt-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider flex items-center">
+                          Column Properties
+                          <span className="ml-1.5 text-slate-400 font-normal normal-case">{(tbl.column_properties || []).length} columns classified</span>
+                          <Tip text="Applies property_role (and linked_entity_type for links/FKs) as tags on each column. Reflects how the column functions within the entity model (identifier, attribute, measure, link, etc.). Also saved to the knowledge base." />
+                        </h4>
+                        <div className="flex items-center gap-2">
+                          <button onClick={async () => {
+                            setPropTagApplying(p => ({ ...p, [tbl.table_name]: true }))
+                            const items = (tbl.column_properties || []).map(cp => ({
+                              table_name: cp.table_name, column_name: cp.column_name,
+                              property_role: colPropOverrides[cp.property_id]?.property_role ?? cp.property_role,
+                              linked_entity_type: colPropOverrides[cp.property_id]?.linked_entity_type ?? cp.linked_entity_type,
+                            }))
+                            try {
+                              const r = await fetch('/api/ontology/apply-property-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ items }) })
+                              const j = await r.json().catch(() => ({}))
+                              setPropTagResults(p => ({ ...p, [tbl.table_name]: j }))
+                            } catch (err) { setPropTagResults(p => ({ ...p, [tbl.table_name]: { error: err.message } })) }
+                            setPropTagApplying(p => ({ ...p, [tbl.table_name]: false }))
+                          }} disabled={propTagApplying[tbl.table_name]}
+                            className="text-[10px] px-2.5 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-50 font-medium">
+                            {propTagApplying[tbl.table_name] ? 'Applying...' : 'Apply Property Role Tags'}
+                          </button>
+                        </div>
+                      </div>
+                      {propTagResults[tbl.table_name] && (() => {
+                        const pr = propTagResults[tbl.table_name]
+                        if (pr.error) return <span className="text-[10px] text-red-600">{pr.error}</span>
+                        const ok = (pr.results || []).filter(r => r.ok).length
+                        const fail = (pr.results || []).filter(r => !r.ok).length
+                        return <span className={`text-[10px] ${fail ? 'text-amber-600' : 'text-green-600'}`}>{ok} tagged{fail ? `, ${fail} failed` : ''}</span>
+                      })()}
+                    </div>
+                  )}
+
+                  {/* FK predictions */}
+                  {show('fk') && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <h4 className="text-xs font-semibold text-slate-500 dark:text-slate-400">Foreign Key Predictions</h4>
+                        {Array.isArray(tbl.fk_predictions) && tbl.fk_predictions.length > 0 && (() => {
+                          const tblKey = tbl.table_name
+                          const selSet = selectedFKs[tblKey] || new Set()
+                          const selCount = selSet.size
+                          const selPreds = () => [...selSet].map(idx => tbl.fk_predictions[idx]).filter(Boolean).map(fk => ({
+                            src_table: fk.src_table, src_column: fk.src_column, dst_table: fk.dst_table, dst_column: fk.dst_column,
+                          }))
+                          return selCount > 0 ? (
+                            <div className="flex items-center gap-1.5">
+                              <button onClick={async () => {
+                                setFkApplying(true); setFkApplyResult(null)
+                                try {
+                                  const r = await fetch('/api/analytics/fk-apply-from-predictions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predictions: selPreds() }) })
+                                  const j = await r.json().catch(() => ({}))
+                                  if (r.ok) {
+                                    setFkApplyResult(j)
+                                    setSelectedFKs(p => ({ ...p, [tblKey]: new Set() }))
+                                  } else {
+                                    setFkApplyResult({ error: j.detail || `Server error (${r.status})` })
+                                  }
+                                } catch (err) { setFkApplyResult({ error: err.message }) }
+                                setFkApplying(false)
+                              }} disabled={fkApplying} className="text-xs px-2 py-0.5 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50"
+                                title="Requires MANAGE on source tables">
+                                {fkApplying ? 'Applying...' : `Apply FK Constraints (${selCount})`}
+                              </button>
+                              <button onClick={async () => {
+                                try {
+                                  const r = await fetch('/api/analytics/fk-generate-sql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predictions: selPreds() }) })
+                                  const j = await r.json().catch(() => ({}))
+                                  setFkGenSql(r.ok ? (j.sql || '') : `-- Error: ${j.detail || 'Server error'}`)
+                                } catch (err) { setFkGenSql(`-- Error: ${err.message}`) }
+                              }} className="text-xs px-2 py-0.5 bg-slate-600 text-white rounded hover:bg-slate-700">
+                                Generate SQL ({selCount})
+                              </button>
+                              <button onClick={() => deleteFkPredictions(selPreds())}
+                                disabled={fkDeleting}
+                                className="text-xs px-2 py-0.5 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50">
+                                {fkDeleting ? 'Removing...' : `Remove (${selCount})`}
+                              </button>
+                            </div>
+                          ) : null
+                        })()}
+                      </div>
+                      <p className="text-[10px] text-slate-400 dark:text-slate-500 italic">
+                        Applying FK constraints requires MANAGE on the source table. If dbxmetagen only has APPLY_TAG, use "Tag All" above instead -- it sets <code className="text-[10px]">fk_references</code> column tags which only require APPLY_TAG.
+                      </p>
+                      <details className="text-xs">
+                        <summary className="cursor-pointer text-indigo-600 hover:text-indigo-800 font-medium">+ Add FK Relationship</summary>
+                        <div className="mt-1 flex items-center gap-2 flex-wrap p-2 bg-indigo-50 dark:bg-indigo-900/20 rounded border border-indigo-200 dark:border-indigo-700/40">
+                          <input placeholder="Source column" id={`add-fk-src-col-${tblIdx}`} className="text-xs border border-indigo-300 rounded px-2 py-0.5 w-28 dark:bg-dbx-navy/60 dark:text-slate-200" />
+                          <input placeholder="Dest table" id={`add-fk-dst-tbl-${tblIdx}`} className="text-xs border border-indigo-300 rounded px-2 py-0.5 w-32 dark:bg-dbx-navy/60 dark:text-slate-200" />
+                          <input placeholder="Dest column" id={`add-fk-dst-col-${tblIdx}`} className="text-xs border border-indigo-300 rounded px-2 py-0.5 w-28 dark:bg-dbx-navy/60 dark:text-slate-200" />
+                          <button onClick={async () => {
+                            const srcCol = document.getElementById(`add-fk-src-col-${tblIdx}`)?.value?.trim()
+                            const dstTbl = document.getElementById(`add-fk-dst-tbl-${tblIdx}`)?.value?.trim()
+                            const dstCol = document.getElementById(`add-fk-dst-col-${tblIdx}`)?.value?.trim()
+                            if (!srcCol || !dstTbl || !dstCol) return
+                            try {
+                              await fetch('/api/analytics/fk-add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ src_column: `${tbl.table_name}.${srcCol}`, dst_column: `${dstTbl}.${dstCol}`, src_table: tbl.table_name, dst_table: dstTbl }) })
+                              document.getElementById(`add-fk-src-col-${tblIdx}`).value = ''
+                              document.getElementById(`add-fk-dst-tbl-${tblIdx}`).value = ''
+                              document.getElementById(`add-fk-dst-col-${tblIdx}`).value = ''
+                              loadData()
+                            } catch {}
+                          }} className="text-[10px] px-2 py-0.5 bg-indigo-600 text-white rounded hover:bg-indigo-700">Add</button>
+                        </div>
+                      </details>
+                      {fkGenSql != null && (
+                        <div className="relative">
+                          <pre className="text-[10px] bg-slate-800 dark:bg-slate-900 text-green-300 dark:text-green-400 rounded p-2 overflow-x-auto whitespace-pre-wrap max-h-40 font-mono">{fkGenSql}</pre>
+                          <div className="absolute top-1 right-1 flex gap-1">
+                            <button onClick={() => { navigator.clipboard.writeText(fkGenSql) }}
+                              className="text-[9px] px-1.5 py-0.5 bg-slate-700 border border-slate-600 rounded hover:bg-slate-600 text-slate-200">Copy</button>
+                            <button onClick={() => setFkGenSql(null)}
+                              className="text-[9px] px-1.5 py-0.5 bg-slate-700 border border-slate-600 rounded hover:bg-slate-600 text-slate-200">Close</button>
+                          </div>
+                        </div>
+                      )}
+                      {fkApplyResult && (
+                        <div className={`text-xs ${fkApplyResult.error ? 'text-red-600' : 'text-green-600'}`}>
+                          {fkApplyResult.error ? String(fkApplyResult.error) : `Applied: ${(fkApplyResult.results || []).filter(r => r.ok).length} succeeded, ${(fkApplyResult.results || []).filter(r => !r.ok).length} failed.`}
+                          {(fkApplyResult.results || []).filter(r => !r.ok).map((r, ri) => (
+                            <div key={ri} className="text-red-500 text-[10px] mt-0.5 truncate" title={r.error}>{r.ddl}: {r.error}</div>
+                          ))}
+                        </div>
+                      )}
+                      {!Array.isArray(tbl.fk_predictions) ? (
+                        <p className="text-xs text-slate-400 italic">FK prediction data not available for this table.</p>
+                      ) : tbl.fk_predictions.length === 0 ? (
+                        <p className="text-xs text-slate-400 italic">No foreign key predictions for this table.</p>
+                      ) : (() => {
+                        const shortTbl = (name) => (name || '').split('.').pop()
+                        const tblKey = tbl.table_name
+                        const selSet = selectedFKs[tblKey] || new Set()
+                        const outgoing = tbl.fk_predictions.map((fk, i) => ({ fk, origIdx: i })).filter(({ fk }) => fk.src_table === tbl.table_name)
+                        const incoming = tbl.fk_predictions.map((fk, i) => ({ fk, origIdx: i })).filter(({ fk }) => fk.dst_table === tbl.table_name && fk.src_table !== tbl.table_name)
+
+                        const renderRow = ({ fk, origIdx }, localCol, remoteCol) => {
+                          const fconf = Number(fk.final_confidence ?? 0)
+                          const confCls = fconf < 0.3 ? 'bg-red-100 text-red-700' : fconf < 0.6 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'
+                          const fkKey = `${tblKey}-${origIdx}`
+                          const isExpReasoning = expandedFKs[fkKey]
+                          return (
+                            <React.Fragment key={origIdx}>
+                              <tr className={`border-b border-slate-100 dark:border-dbx-navy-400/20 hover:bg-indigo-50/30 dark:hover:bg-dbx-navy-500/30 ${selSet.has(origIdx) ? 'bg-indigo-50/50 dark:bg-indigo-900/20' : ''}`}>
+                                <td className="px-1 py-1">
+                                  <input type="checkbox" checked={selSet.has(origIdx)} onChange={() => {
+                                    setSelectedFKs(prev => {
+                                      const ns = new Set(prev[tblKey] || [])
+                                      if (ns.has(origIdx)) ns.delete(origIdx); else ns.add(origIdx)
+                                      return { ...prev, [tblKey]: ns }
+                                    })
+                                  }} className="rounded border-slate-300" />
+                                </td>
+                                <td className="px-2 py-1 text-slate-600 dark:text-slate-300 font-mono">{localCol}</td>
+                                <td className="px-2 py-1 text-slate-600 dark:text-slate-300 font-mono">{remoteCol}</td>
+                                <td className="px-2 py-1"><span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${confCls}`}>{fconf.toFixed(2)}</span></td>
+                                <td className="px-1 py-1">{fk.review_updated_at ? (
+                                  <span className={`text-[9px] px-1 py-0.5 rounded-full font-medium ${fk.is_fk === true || fk.is_fk === 'true' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                    {fk.is_fk === true || fk.is_fk === 'true' ? 'approved' : 'rejected'}
+                                  </span>
+                                ) : null}</td>
+                                <td className="px-2 py-1 text-slate-500 dark:text-slate-400">{Number(fk.ai_confidence ?? 0).toFixed(2)}</td>
+                                <td className="px-2 py-1 text-slate-500 dark:text-slate-400">{Number(fk.col_similarity ?? 0).toFixed(2)}</td>
+                                <td className="px-2 py-1 font-mono text-[10px] whitespace-nowrap">{fkEvidence(fk)}</td>
+                                <td className="px-2 py-1 text-slate-500 dark:text-slate-400 max-w-xs truncate cursor-pointer" title="Click to expand"
+                                  onClick={() => setExpandedFKs(p => ({ ...p, [fkKey]: !p[fkKey] }))}>
+                                  {fk.ai_reasoning || '--'}
+                                </td>
+                                <td className="px-1 py-1 flex items-center gap-1">
+                                  <button onClick={async () => {
+                                    try {
+                                      await fetch('/api/analytics/fk-review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ src_column: fk.src_column, dst_column: fk.dst_column, src_table: fk.src_table, dst_table: fk.dst_table, is_fk: true }) })
+                                      loadData()
+                                    } catch {}
+                                  }} title="Approve this FK" className="text-green-500 hover:text-green-700 text-xs font-bold">&#x2713;</button>
+                                  <button onClick={async () => {
+                                    try {
+                                      await fetch('/api/analytics/fk-review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ src_column: fk.src_column, dst_column: fk.dst_column, src_table: fk.src_table, dst_table: fk.dst_table, is_fk: false }) })
+                                      loadData()
+                                    } catch {}
+                                  }} title="Reject this FK" className="text-orange-500 hover:text-orange-700 text-xs font-bold">&#x2717;</button>
+                                  <button onClick={() => deleteFkPredictions([{
+                                    src_table: fk.src_table, src_column: fk.src_column,
+                                    dst_table: fk.dst_table, dst_column: fk.dst_column,
+                                  }])} disabled={fkDeleting} title="Delete this FK prediction"
+                                    className="text-red-400 hover:text-red-600 disabled:opacity-50 text-xs">
+                                    &#x2715;
+                                  </button>
+                                </td>
+                              </tr>
+                              {isExpReasoning && fk.ai_reasoning && (
+                                <tr><td colSpan={10} className="px-3 py-2 bg-slate-50 dark:bg-dbx-navy-500/30 text-xs text-slate-600 dark:text-slate-300 italic">{fk.ai_reasoning}</td></tr>
+                              )}
+                            </React.Fragment>
+                          )
+                        }
+
+                        return (
+                          <div className="space-y-3">
+                            {outgoing.length > 0 && (
+                              <div className="overflow-x-auto">
+                                <p className="text-[10px] font-semibold text-indigo-500 dark:text-indigo-400 uppercase tracking-wider mb-1">&#8594; Outgoing (this table references)</p>
+                                <table className="min-w-full text-xs">
+                                  <thead><tr className="bg-dbx-oat/50 dark:bg-dbx-navy-500/50">
+                                    <th className="w-8 px-1 py-1"></th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">Column</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">References</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Combined final confidence">Final</th>
+                                    <th className="text-left px-1 py-1 font-semibold text-slate-500 dark:text-slate-400">Status</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="AI model confidence">AI</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Column embedding similarity">Sim</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Referential integrity · actual join hit rate · parent-key uniqueness (the data probes behind the score)">RI·join·PK</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">Reasoning</th>
+                                    <th className="w-8 px-1 py-1"></th>
+                                  </tr></thead>
+                                  <tbody>
+                                    {outgoing.map(item => renderRow(item,
+                                      (item.fk.src_column || '').split('.').pop(),
+                                      `${shortTbl(item.fk.dst_table)}.${(item.fk.dst_column || '').split('.').pop()}`
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                            {incoming.length > 0 && (
+                              <div className="overflow-x-auto">
+                                <p className="text-[10px] font-semibold text-teal-500 dark:text-teal-400 uppercase tracking-wider mb-1">&#8592; Incoming (referenced by)</p>
+                                <table className="min-w-full text-xs">
+                                  <thead><tr className="bg-dbx-oat/50 dark:bg-dbx-navy-500/50">
+                                    <th className="w-8 px-1 py-1"></th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">From</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">Column</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Combined final confidence">Final</th>
+                                    <th className="text-left px-1 py-1 font-semibold text-slate-500 dark:text-slate-400">Status</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="AI model confidence">AI</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Column embedding similarity">Sim</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400" title="Referential integrity · actual join hit rate · parent-key uniqueness (the data probes behind the score)">RI·join·PK</th>
+                                    <th className="text-left px-2 py-1 font-semibold text-slate-500 dark:text-slate-400">Reasoning</th>
+                                    <th className="w-8 px-1 py-1"></th>
+                                  </tr></thead>
+                                  <tbody>
+                                    {incoming.map(item => renderRow(item,
+                                      `${shortTbl(item.fk.src_table)}.${(item.fk.src_column || '').split('.').pop()}`,
+                                      (item.fk.dst_column || '').split('.').pop()
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                            {outgoing.length === 0 && incoming.length === 0 && (
+                              <p className="text-xs text-slate-400 italic">No foreign key predictions for this table.</p>
+                            )}
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )})}
+          {visibleReview.length > pageSize && pageSize > 0 && (
+            <div className="flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400">
+              <span>{visibleReview.length} tables total</span>
+              <div className="flex items-center gap-2">
+                <button disabled={page === 0} onClick={() => { setPage(p => p - 1); window.scrollTo({ top: 0, behavior: 'smooth' }) }} className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-dbx-navy-500/50">&lsaquo; Prev</button>
+                <span>Page {page + 1} of {totalPages}</span>
+                <button disabled={page >= totalPages - 1} onClick={() => { setPage(p => p + 1); window.scrollTo({ top: 0, behavior: 'smooth' }) }} className="px-2 py-0.5 rounded border border-slate-300 dark:border-dbx-navy-400/40 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-dbx-navy-500/50">Next &rsaquo;</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Export bar */}
+      {reviewData.length > 0 && (
+        <div className="card p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Export & Apply</h3>
+          <div className="flex flex-wrap items-center gap-3">
+            <select value={ddlCategory} onChange={e => { setDdlCategory(e.target.value); setDdlSql(''); setDdlApplyResult(null) }}
+              className="border border-slate-300 dark:border-dbx-navy-400/40 rounded-lg px-3 py-1.5 text-sm bg-white dark:bg-dbx-navy/60 dark:text-slate-200">
+              <option value="comments">Comments</option>
+              <option value="domain">Domain Tags</option>
+              <option value="sensitivity">Sensitivity Tags</option>
+            </select>
+            {ddlCategory === 'domain' && (
+              <>
+                <input value={customDomainKey} onChange={e => setCustomDomainKey(e.target.value)} placeholder="domain tag key (default: domain)"
+                  className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-52 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+                <input value={customSubdomainKey} onChange={e => setCustomSubdomainKey(e.target.value)} placeholder="subdomain tag key (default: subdomain)"
+                  className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-56 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+              </>
+            )}
+            {ddlCategory === 'sensitivity' && (
+              <>
+                <input value={customSensitivityKey} onChange={e => setCustomSensitivityKey(e.target.value)} placeholder="classification tag key (default: data_classification)"
+                  className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-64 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+                <input value={customSensitivityTypeKey} onChange={e => setCustomSensitivityTypeKey(e.target.value)} placeholder="subclassification tag key (default: data_subclassification)"
+                  className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-68 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+              </>
+            )}
+            <button onClick={generateDdl} disabled={ddlLoading} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400 disabled:opacity-50">Generate DDL</button>
+            <button onClick={applyDdl} disabled={ddlLoading} className="px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50">Generate &amp; Apply DDL</button>
+            <span className="text-[10px] text-slate-400 dark:text-slate-500" title="Apply DDL will execute ALTER TABLE / COMMENT ON statements against your Unity Catalog tables">Apply writes comments and tags to your tables</span>
+            <span className="border-l border-slate-300 dark:border-dbx-navy-400/40 h-6" />
+            <button onClick={() => exportVolume('tsv')} disabled={exportLoading} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400 disabled:opacity-50">Export TSV</button>
+            <button onClick={() => exportVolume('excel')} disabled={exportLoading} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400 disabled:opacity-50">Export Excel</button>
+            <span className="border-l border-slate-300 h-6" />
+            <button onClick={openVolumeBrowser} disabled={importLoading} className="px-4 py-1.5 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50">Import from Volume</button>
+            <label className={`px-4 py-1.5 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 cursor-pointer ${importLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+              Upload File
+              <input type="file" accept=".tsv,.xlsx,.xls" onChange={importUpload} className="hidden" />
+            </label>
+          </div>
+          {ddlError && <p className="text-sm text-red-600">{ddlError}</p>}
+          {ddlApplyResult && (ddlApplyResult.ok
+            ? <p className="text-sm text-green-600">Applied {ddlApplyResult.applied} statement(s).</p>
+            : ddlApplyResult.detail
+              ? <p className="text-sm text-red-600">{ddlApplyResult.detail}</p>
+              : <div className="space-y-2">
+                  <p className="text-sm text-amber-700">Applied {ddlApplyResult.applied} of {ddlApplyResult.applied + (ddlApplyResult.errors?.length || 0)} statement(s).</p>
+                  {ddlApplyResult.errors?.map((e, i) => (
+                    <div key={i} className="text-xs bg-red-50 border border-red-200 rounded p-2">
+                      <p className="text-red-700 font-mono truncate">{e.statement}</p>
+                      <p className="text-red-600 mt-1">{e.error}</p>
+                      {e.governed_tag && (
+                        <p className="text-amber-700 mt-1 font-medium">{e.hint}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+          )}
+          {exportResult && (exportResult.ok
+            ? <p className="text-sm text-green-600">Exported {exportResult.rows} rows to <span className="font-mono text-xs">{exportResult.path}</span></p>
+            : <p className="text-sm text-red-600">{errMsg(exportResult.detail)}</p>)}
+          {importResult && (importResult.ok
+            ? <p className="text-sm text-green-600">Imported {importResult.total_rows} rows: {importResult.tables_updated} tables, {importResult.columns_updated} columns updated{importResult.skipped ? `, ${importResult.skipped} skipped` : ''}{importResult.saved_to ? ` (saved to ${importResult.saved_to})` : ''}</p>
+            : <p className="text-sm text-red-600">Import failed: {errMsg(importResult.detail)}</p>)}
+          {ddlSql && (
+            <div className="relative">
+              <pre className="text-xs text-slate-800 dark:text-slate-200 bg-dbx-oat dark:bg-dbx-navy-600 border border-slate-200 dark:border-dbx-navy-400/30 rounded-lg p-3 overflow-auto max-h-64 whitespace-pre-wrap">{ddlSql}</pre>
+              <button onClick={() => navigator.clipboard.writeText(ddlSql)} className="absolute top-2 right-2 px-2 py-1 bg-dbx-oat-light dark:bg-dbx-navy-500 border border-slate-200 dark:border-dbx-navy-400/30 rounded text-xs text-slate-700 dark:text-slate-200 hover:bg-dbx-oat dark:hover:bg-dbx-navy-400">Copy</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* DDL Bundle -- unified advanced metadata export */}
+      <div className="card p-5 space-y-3">
+        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          DDL Bundle <Tip text="Generate a unified SQL script covering comments, domain tags, sensitivity tags, ontology tags, and FK metadata. Export for use in other environments or apply directly." />
+        </h3>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Select the metadata types to include, then <strong>Generate Bundle</strong> to preview the SQL or <strong>Generate & Apply Bundle</strong> to execute it against your catalog.
+          Use the optional target catalog/schema fields to redirect output to a different location. You can also download or copy the generated SQL for manual review.
+        </p>
+        <p className="text-[10px] text-amber-600 dark:text-amber-400">
+          Applying a bundle will execute SQL statements (COMMENT ON, ALTER TABLE SET TAGS, ADD CONSTRAINT) against your Unity Catalog tables. Existing comments and tags of the selected types will be overwritten.
+        </p>
+        <div className="flex flex-wrap gap-2 items-center">
+          {[
+            ['comments', 'Comments'], ['domain', 'Domain'], ['sensitivity', 'Sensitivity'],
+            ['ontology', 'Ontology Tags'], ['fk', 'Foreign Keys'],
+          ].map(([key, label]) => (
+            <label key={key} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border cursor-pointer select-none transition-all duration-200 ${bundleTypes[key] ? 'bg-dbx-teal/10 border-dbx-teal text-dbx-teal dark:bg-dbx-teal/20 dark:text-dbx-teal-light' : 'bg-white dark:bg-dbx-navy/60 border-slate-300 dark:border-dbx-navy-400/40 text-slate-600 dark:text-slate-400'}`}>
+              <input type="checkbox" checked={!!bundleTypes[key]} onChange={() => setBundleTypes(prev => ({ ...prev, [key]: !prev[key] }))} className="sr-only" />
+              {label}
+            </label>
+          ))}
+          {bundleTypes.fk && (
+            <select value={fkMode} onChange={e => setFkMode(e.target.value)}
+              className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1 text-xs bg-white dark:bg-dbx-navy/60 dark:text-slate-200">
+              <option value="tags">FK as Tags</option>
+              <option value="constraints">FK as Constraints</option>
+            </select>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <input value={bundleTargetCatalog} onChange={e => setBundleTargetCatalog(e.target.value)} placeholder="Target catalog (optional)"
+            className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-48 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+          <input value={bundleTargetSchema} onChange={e => setBundleTargetSchema(e.target.value)} placeholder="Target schema (optional)"
+            className="border border-slate-300 dark:border-dbx-navy-400/40 rounded px-2 py-1.5 text-sm w-48 bg-white dark:bg-dbx-navy/60 dark:text-slate-200" />
+          <button onClick={generateBundle} disabled={bundleLoading} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400 disabled:opacity-50">Generate Bundle</button>
+          <button onClick={applyBundle} disabled={bundleLoading} className="px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50">Generate & Apply Bundle</button>
+          {bundleSql && (
+            <>
+              <button onClick={downloadBundleSql} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400">Download .sql</button>
+              <button onClick={() => navigator.clipboard.writeText(bundleSql)} className="px-4 py-1.5 bg-dbx-oat dark:bg-dbx-navy-500 text-slate-700 dark:text-slate-200 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark dark:hover:bg-dbx-navy-400">Copy SQL</button>
+            </>
+          )}
+        </div>
+        {bundleLoading && <p className="text-sm text-slate-500">
+          {bundleApplyProgress ? `Applying: ${bundleApplyProgress.current_section || '...'} (${bundleApplyProgress.total_applied || 0} applied)` : 'Generating DDL bundle...'}
+        </p>}
+        {bundleError && <p className="text-sm text-red-600">{bundleError}</p>}
+        {bundleWarnings && bundleWarnings.length > 0 && (
+          <div className="text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded px-3 py-2 space-y-0.5">
+            {bundleWarnings.map((w, i) => <p key={i}>{w}</p>)}
+          </div>
+        )}
+        {bundleCounts && (
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(bundleCounts).filter(([, n]) => n > 0).map(([k, n]) => (
+              <span key={k} className="px-2 py-0.5 bg-dbx-teal/10 dark:bg-dbx-teal/20 text-dbx-teal dark:text-dbx-teal-light rounded text-xs font-medium">{k.replace(/_/g, ' ')}: {n}</span>
+            ))}
+          </div>
+        )}
+        {bundleVolumePath && <p className="text-xs text-slate-500 dark:text-slate-400 font-mono">Saved to: {bundleVolumePath}</p>}
+        {bundleApplyResult && (bundleApplyResult.ok
+          ? <p className="text-sm text-green-600">Applied {bundleApplyResult.applied} statement(s).</p>
+          : bundleApplyResult.detail
+            ? <p className="text-sm text-red-600">{bundleApplyResult.detail}</p>
+            : <p className="text-sm text-amber-700">Applied {bundleApplyResult.applied}, {bundleApplyResult.errors} failed.</p>
+        )}
+        {bundleSql && (
+          <div className="relative">
+            <pre className="text-xs text-slate-800 dark:text-slate-200 bg-dbx-oat dark:bg-dbx-navy-600 border border-slate-200 dark:border-dbx-navy-400/30 rounded-lg p-3 overflow-auto max-h-80 whitespace-pre-wrap">{bundleSql}</pre>
+          </div>
+        )}
+      </div>
+
+      {/* Standalone import section (always visible) */}
+      {reviewData.length === 0 && (
+        <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-600 p-4 shadow-sm space-y-3">
+          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Import Reviewed Metadata</h3>
+          <p className="text-xs text-slate-500 dark:text-slate-400">Import a previously exported and reviewed TSV or Excel file to update the knowledge base tables.</p>
+          <div className="flex items-center gap-3">
+            <button onClick={openVolumeBrowser} disabled={importLoading} className="px-4 py-1.5 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50">Import from Volume</button>
+            <label className={`px-4 py-1.5 bg-slate-600 text-white rounded-lg text-sm font-medium hover:bg-slate-700 cursor-pointer ${importLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+              Upload File
+              <input type="file" accept=".tsv,.xlsx,.xls" onChange={importUpload} className="hidden" />
+            </label>
+            {importLoading && <span className="text-sm text-slate-500">Importing...</span>}
+          </div>
+          {importResult && (importResult.ok
+            ? <p className="text-sm text-green-600">Imported {importResult.total_rows} rows: {importResult.tables_updated} tables, {importResult.columns_updated} columns updated{importResult.skipped ? `, ${importResult.skipped} skipped` : ''}</p>
+            : <p className="text-sm text-red-600">Import failed: {errMsg(importResult.detail)}</p>)}
+        </div>
+      )}
+
+      {/* Volume file browser modal */}
+      {showVolumeBrowser && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-6 animate-fade-in" role="dialog" aria-modal="true">
+          <div className="bg-white dark:bg-dbx-navy-650 rounded-2xl shadow-elevated max-w-lg w-full max-h-[70vh] flex flex-col animate-slide-up">
+            <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-slate-200 dark:border-slate-600">
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">Select File from Volume</h3>
+              <button onClick={() => setShowVolumeBrowser(false)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300" aria-label="Close">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-3">
+              {volumeFilesLoading ? (
+                <p className="text-sm text-slate-500 py-4">Loading files...</p>
+              ) : volumeFilesError ? (
+                <p className="text-sm text-red-600 py-4">{volumeFilesError}</p>
+              ) : volumeFiles.length === 0 ? (
+                <p className="text-sm text-slate-400 py-4">No TSV or Excel files found in the volume.</p>
+              ) : (
+                <div className="space-y-1">
+                  {volumeFiles.map((f, i) => (
+                    <button key={i} onClick={() => importFromVolume(f.path)}
+                      className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                      <div className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate">{f.name}</div>
+                      <div className="text-xs text-slate-400 dark:text-slate-500 truncate">{f.path}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="px-6 py-3 border-t border-slate-200 dark:border-slate-600">
+              <button onClick={() => setShowVolumeBrowser(false)} className="px-4 py-1.5 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EditableTableKB({ rows, original, setRows }) {
+  if (!rows?.length) return <p className="text-sm text-slate-400 py-4">No data available.</p>
+  const editable = ['comment', 'domain', 'subdomain']
+  const otherCols = ['table_name', 'catalog', 'schema', 'table_short_name', 'has_pii', 'has_phi', 'created_at', 'updated_at', 'review_updated_at'].filter(c => rows[0] && c in rows[0])
+  const onChange = (i, field, value) => {
+    setRows(prev => prev.map((r, j) => j === i ? { ...r, [field]: value } : r))
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr>
+            {otherCols.slice(0, 4).map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase">{c}</th>)}
+            {editable.map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase">{c}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} className={`border-b border-slate-100 ${original && (editable.some(f => row[f] !== original[i]?.[f])) ? 'bg-amber-50' : ''} hover:bg-orange-50/30`}>
+              {otherCols.slice(0, 4).map(c => <td key={c} className="px-3 py-2 max-w-[12rem] truncate text-slate-700 dark:text-slate-300">{String(row[c] ?? '')}</td>)}
+              {editable.map(f => (
+                <td key={f} className="px-2 py-1">
+                  <input value={row[f] ?? ''} onChange={e => onChange(i, f, e.target.value)}
+                    className="w-full min-w-[8rem] border border-slate-300 rounded px-2 py-1 text-sm focus:ring-2 focus:ring-orange-500" />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function EditableColumnKB({ rows, original, setRows }) {
+  if (!rows?.length) return <p className="text-sm text-slate-400 py-4">No data available.</p>
+  const editable = ['comment', 'classification']
+  const otherCols = ['column_id', 'table_name', 'schema', 'column_name', 'data_type', 'confidence', 'created_at', 'updated_at', 'review_updated_at'].filter(c => rows[0] && c in rows[0])
+  const onChange = (i, field, value) => {
+    setRows(prev => prev.map((r, j) => j === i ? { ...r, [field]: value } : r))
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr>
+            {otherCols.slice(0, 5).map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase">{c}</th>)}
+            {editable.map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-slate-200 text-xs uppercase">{c}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} className={`border-b border-slate-100 ${original && editable.some(f => row[f] !== original[i]?.[f]) ? 'bg-amber-50' : ''} hover:bg-orange-50/30`}>
+              {otherCols.slice(0, 5).map(c => <td key={c} className="px-3 py-2 max-w-[10rem] truncate text-slate-700 dark:text-slate-300">{String(row[c] ?? '')}</td>)}
+              {editable.map(f => (
+                <td key={f} className="px-2 py-1">
+                  <input value={row[f] ?? ''} onChange={e => onChange(i, f, e.target.value)}
+                    className="w-full min-w-[8rem] border border-slate-300 rounded px-2 py-1 text-sm focus:ring-2 focus:ring-orange-500" />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function EditableSchemaKB({ rows, original, setRows }) {
+  if (!rows?.length) return <p className="text-sm text-slate-400 py-4">No data available.</p>
+  const editable = ['comment', 'domain']
+  const otherCols = ['schema_id', 'catalog', 'schema_name', 'has_pii', 'has_phi', 'table_count', 'created_at', 'updated_at', 'review_updated_at'].filter(c => rows[0] && c in rows[0])
+  const onChange = (i, field, value) => {
+    setRows(prev => prev.map((r, j) => j === i ? { ...r, [field]: value } : r))
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr>
+            {otherCols.slice(0, 4).map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase">{c}</th>)}
+            {editable.map(c => <th key={c} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase">{c}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} className={`border-b border-slate-100 ${original && editable.some(f => row[f] !== original[i]?.[f]) ? 'bg-amber-50' : ''} hover:bg-orange-50/30`}>
+              {otherCols.slice(0, 4).map(c => <td key={c} className="px-3 py-2 max-w-[10rem] truncate text-slate-700 dark:text-slate-300">{String(row[c] ?? '')}</td>)}
+              {editable.map(f => (
+                <td key={f} className="px-2 py-1">
+                  <input value={row[f] ?? ''} onChange={e => onChange(i, f, e.target.value)}
+                    className="w-full min-w-[8rem] border border-slate-300 rounded px-2 py-1 text-sm focus:ring-2 focus:ring-orange-500" />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function EntityTagsPanel() {
+  const [entities, setEntities] = useState([])
+  const [relationships, setRelationships] = useState([])
+  const [error, setError] = useState(null)
+  const [selected, setSelected] = useState(new Set())
+  const [applyResult, setApplyResult] = useState(null)
+  const [applying, setApplying] = useState(false)
+  const [expanded, setExpanded] = useState(new Set())
+  const shortName = id => (id || '').split('.').pop()
+
+  useEffect(() => {
+    safeFetch('/api/ontology/entities').then(r => {
+      setEntities(Array.isArray(r.data) ? r.data : [])
+      if (r.error) setError(r.error)
+    })
+    safeFetch('/api/ontology/relationships').then(r => {
+      setRelationships(Array.isArray(r.data) ? r.data : [])
+      if (r.error) setError(prev => prev || r.error)
+    })
+  }, [])
+
+  const groupedEntities = useMemo(() => {
+    const map = new Map()
+    entities.forEach(e => {
+      const st = Array.isArray(e.source_tables) ? e.source_tables : (typeof e.source_tables === 'string' ? (() => { try { return JSON.parse(e.source_tables) } catch { return [e.source_tables] } })() : [])
+      const key = `${e.entity_type}::${st.sort().join(',')}`
+      const existing = map.get(key)
+      if (!existing || (Number(e.confidence) || 0) > (Number(existing.confidence) || 0))
+        map.set(key, { ...e, source_tables: st, _count: (existing?._count || 0) + 1 })
+      else map.set(key, { ...existing, _count: existing._count + 1 })
+    })
+    return Array.from(map.values())
+  }, [entities])
+
+  const sourceTablesList = (e) => {
+    const st = e.source_tables
+    if (Array.isArray(st)) return st
+    if (typeof st === 'string') { try { const p = JSON.parse(st); return Array.isArray(p) ? p : [st] } catch { return [st] } }
+    return []
+  }
+
+  const applyToTable = async () => {
+    if (selected.size === 0) return
+    setApplying(true); setApplyResult(null)
+    const selections = []
+    selected.forEach(i => {
+      const e = groupedEntities[i]
+      const tables = sourceTablesList(e)
+      if (e?.entity_type && tables.length) selections.push({ entity_type: e.entity_type, source_tables: tables })
+    })
+    if (!selections.length) { setApplying(false); return }
+    try {
+      const r = await fetch('/api/ontology/apply-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ selections }) })
+      const j = await r.json().catch(() => ({}))
+      setApplyResult(r.ok ? j : { error: j.detail || j })
+    } catch (e) { setApplyResult({ error: e.message }) }
+    setApplying(false)
+  }
+
+  return (
+    <div className="card p-6">
+      <ErrorBanner error={error} />
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-semibold text-slate-800">Discovered Entities</h2>
+        {selected.size > 0 && (
+          <button onClick={applyToTable} disabled={applying}
+            className="px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50">
+            Apply tags ({selected.size})
+          </button>
+        )}
+      </div>
+      {applyResult && (
+        <div className={`mb-4 text-sm ${applyResult.error ? 'text-red-600' : 'text-green-600'}`}>
+          {applyResult.error ? JSON.stringify(applyResult.error) : `Applied: ${(applyResult.results || []).filter(r => r.ok).length} ok, ${(applyResult.results || []).filter(r => !r.ok).length} failed.`}
+        </div>
+      )}
+      {groupedEntities.length === 0
+        ? <p className="text-sm text-slate-400">No entities discovered yet.</p>
+        : <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead><tr>
+                <th className="w-10 px-2 py-2.5 bg-dbx-oat border-b border-slate-200"></th>
+                {['Entity', 'Type', 'Conf', 'Validated', 'Source Tables', 'Columns / Bindings'].map(h =>
+                  <th key={h} className="text-left px-3 py-2.5 bg-dbx-oat font-semibold text-slate-800 dark:text-slate-200 border-b border-slate-200 text-xs uppercase tracking-wider">{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {groupedEntities.map((e, i) => {
+                  const bindings = Array.isArray(e.column_bindings) ? e.column_bindings
+                    : typeof e.column_bindings === 'string' ? (() => { try { const p = JSON.parse(e.column_bindings); return Array.isArray(p) ? p : [] } catch { return [] } })()
+                    : []
+                  const srcCols = Array.isArray(e.source_columns) ? e.source_columns
+                    : typeof e.source_columns === 'string' ? (() => { try { const p = JSON.parse(e.source_columns); return Array.isArray(p) ? p : [] } catch { return [] } })()
+                    : []
+                  const isExpanded = expanded.has(i)
+                  const hasDetail = bindings.length > 0 || srcCols.length > 0
+                  return (
+                    <React.Fragment key={i}>
+                      <tr className={`border-b border-slate-100 hover:bg-orange-50/30 ${selected.has(i) ? 'bg-orange-50/50' : ''}`}>
+                        <td className="px-2 py-2"><input type="checkbox" checked={selected.has(i)} onChange={() => setSelected(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n })} className="rounded border-slate-300" /></td>
+                        <td className="px-3 py-2 font-medium text-slate-700">{e.entity_name}</td>
+                        <td className="px-3 py-2"><span className="inline-block bg-orange-100 text-red-700 text-xs font-medium px-2 py-0.5 rounded-full">{e.entity_type}</span></td>
+                        <td className="px-3 py-2 text-slate-600">{Number(e.confidence).toFixed(2)}</td>
+                        <td className="px-3 py-2">{e.validated === 'true' || e.validated === true ? <span className="text-emerald-600 font-medium">Yes</span> : <span className="text-slate-400">No</span>}</td>
+                        <td className="px-3 py-2 max-w-xs truncate text-slate-500">{Array.isArray(e.source_tables) ? e.source_tables.map(shortName).join(', ') : String(e.source_tables ?? '')}</td>
+                        <td className="px-3 py-2">{hasDetail ? (
+                          <button onClick={() => setExpanded(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n })}
+                            className="text-xs text-blue-600 hover:underline">
+                            {bindings.length > 0 ? `${bindings.length} mappings` : `${srcCols.length} cols`}{isExpanded ? ' (hide)' : ' (show)'}
+                          </button>
+                        ) : <span className="text-xs text-slate-400">--</span>}</td>
+                      </tr>
+                      {isExpanded && hasDetail && (
+                        <tr className="bg-slate-50/60"><td></td><td colSpan={6} className="px-3 py-2">
+                          {bindings.length > 0 && <div className="mb-1"><span className="text-xs font-semibold text-slate-500 mr-2">Attribute mappings:</span>
+                            <span className="flex flex-wrap gap-1 mt-0.5">{bindings.map((b, bi) => <span key={bi} className="inline-block bg-indigo-50 text-indigo-700 text-xs px-1.5 py-0.5 rounded">{b.attribute_name || '?'} &larr; {shortName(b.bound_column || '')}</span>)}</span></div>}
+                          {srcCols.length > 0 && bindings.length === 0 && <div><span className="text-xs font-semibold text-slate-500 mr-2">Source columns:</span><span className="text-xs text-slate-600">{srcCols.join(', ')}</span></div>}
+                        </td></tr>
+                      )}
+                    </React.Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+      }
+    </div>
+  )
+}
+
+export default function MetadataReview({ onNavigate, pipelineStats }) {
+  const [tab, setTab] = useState('editor')
+  const [data, setData] = useState([])
+  const [original, setOriginal] = useState([])
+  const [error, setError] = useState(null)
+  const [filterTable, setFilterTable] = useState('')
+  const [filterExtra, setFilterExtra] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const endpoints = { log: '/api/metadata/log', kb: '/api/metadata/knowledge-base', columns: '/api/metadata/column-kb', schemas: '/api/metadata/schema-kb' }
+  const patchEndpoints = { kb: '/api/metadata/knowledge-base', columns: '/api/metadata/column-kb', schemas: '/api/metadata/schema-kb' }
+
+  const buildUrl = useCallback((key) => {
+    const base = endpoints[key]
+    const params = new URLSearchParams()
+    if (key === 'kb') {
+      if (filterTable) params.set('table_name', filterTable)
+      if (filterExtra) params.set('schema_name', filterExtra)
+    } else if (key === 'columns') {
+      if (filterTable) params.set('table_name', filterTable)
+      if (filterExtra) params.set('column_name', filterExtra)
+    } else if (key === 'schemas' && filterExtra) {
+      params.set('schema_name', filterExtra)
+    } else if (key === 'log' && filterTable) {
+      params.set('table_name', filterTable)
+    }
+    const q = params.toString()
+    return q ? `${base}?${q}` : base
+  }, [filterTable, filterExtra])
+
+  const load = async (key) => {
+    setLoading(true)
+    const r = await safeFetch(buildUrl(key))
+    const rows = Array.isArray(r.data) ? r.data : []
+    setData(rows)
+    setOriginal(rows.map(row => ({ ...row })))
+    setError(r.error)
+    setLoading(false)
+  }
+
+  useEffect(() => { if (!['editor', 'fk_apply', 'entity_tags'].includes(tab)) load(tab) }, [tab])
+
+  const getModifiedRows = () => {
+    if (tab === 'kb') {
+      return data.filter((row, i) => ['comment', 'domain', 'subdomain'].some(f => row[f] !== original[i]?.[f]))
+    }
+    if (tab === 'columns') {
+      return data.filter((row, i) => ['comment', 'classification'].some(f => row[f] !== original[i]?.[f]))
+    }
+    if (tab === 'schemas') {
+      return data.filter((row, i) => ['comment', 'domain'].some(f => row[f] !== original[i]?.[f]))
+    }
+    return []
+  }
+
+  const handleUpdate = async () => {
+    const modified = getModifiedRows()
+    if (modified.length === 0) return
+    const ep = patchEndpoints[tab]
+    if (!ep) return
+    setSaving(true)
+    setError(null)
+    let body
+    if (tab === 'kb') {
+      body = modified.map(r => ({ table_name: r.table_name, comment: r.comment ?? undefined, domain: r.domain ?? undefined, subdomain: r.subdomain ?? undefined }))
+    } else if (tab === 'columns') {
+      body = modified.map(r => ({ column_id: r.column_id, comment: r.comment ?? undefined, classification: r.classification ?? undefined }))
+    } else if (tab === 'schemas') {
+      body = modified.map(r => ({ schema_id: r.schema_id, comment: r.comment ?? undefined, domain: r.domain ?? undefined }))
+    }
+    try {
+      const res = await fetch(ep, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      if (!res.ok) {
+        const t = await res.text()
+        let msg = res.status + ''
+        try { const j = JSON.parse(t); if (j.detail) msg = j.detail } catch {}
+        setError(msg)
+        setSaving(false)
+        return
+      }
+      setOriginal(data.map(row => ({ ...row })))
+      setSaving(false)
+    } catch (e) {
+      setError(e.message)
+      setSaving(false)
+    }
+  }
+
+  const modifiedCount = (tab === 'log' || !patchEndpoints[tab]) ? 0 : getModifiedRows().length
+  const isEditable = tab === 'kb' || tab === 'columns' || tab === 'schemas'
+
+  const [ddlScope, setDdlScope] = useState('table')
+  const [ddlIdentifiers, setDdlIdentifiers] = useState('')
+  const [ddlSql, setDdlSql] = useState('')
+  const [ddlLoading, setDdlLoading] = useState(false)
+  const [ddlApplyResult, setDdlApplyResult] = useState(null)
+  const [ddlTagKey, setDdlTagKey] = useState('geo_classification')
+
+  const _buildDdlBody = () => {
+    const identifiers = ddlIdentifiers.trim() ? ddlIdentifiers.split(/[\n,]/).map(s => s.trim()).filter(Boolean) : []
+    const body = { scope: ddlScope, identifiers: identifiers.length ? identifiers : undefined }
+    if (ddlScope === 'geo' && ddlTagKey.trim()) body.tag_key = ddlTagKey.trim()
+    return body
+  }
+
+  const runGenerateDdl = async () => {
+    setDdlLoading(true)
+    setDdlApplyResult(null)
+    const r = await fetch('/api/metadata/generate-ddl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_buildDdlBody())
+    })
+    const j = await r.json().catch(() => ({}))
+    setDdlSql(j.sql || j.detail || '')
+    setDdlLoading(false)
+  }
+
+  const runApplyDdl = async () => {
+    if (!confirm('Apply DDL changes to your catalog? This modifies table/column metadata.')) return
+    setDdlLoading(true)
+    setDdlApplyResult(null)
+    const r = await fetch('/api/metadata/apply-ddl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_buildDdlBody())
+    })
+    const j = await r.json().catch(() => ({}))
+    if (r.ok) {
+      setDdlApplyResult({ ok: true, applied: j.applied })
+    } else {
+      setDdlApplyResult({ ok: false, detail: j.detail || j })
+    }
+    setDdlLoading(false)
+  }
+
+  return (
+    <div className="space-y-4">
+      <PageHeader title="Review & Apply" subtitle="Inspect AI-generated metadata, make corrections, then apply approved changes to Unity Catalog" />
+      <ErrorBanner error={error} />
+      <PrereqBanner
+        show={pipelineStats && pipelineStats.profiled === 0}
+        message="No metadata generated yet. Run Generate Metadata (Step 1) first to produce results you can review here."
+        actionLabel="Go to Generate Metadata"
+        onAction={() => onNavigate?.('jobs')}
+      />
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="inline-flex bg-dbx-oat/60 dark:bg-dbx-navy-650 rounded-xl p-1 shadow-inner-soft">
+          {[['editor', 'Review Editor'], ['fk_apply', 'FK Apply'], ['entity_tags', 'Entity Tags'], ['kb', 'Table KB'], ['columns', 'Column KB'], ['schemas', 'Schema KB'], ['log', 'Generation Log']]
+            // NOTE: Only 'editor' and 'log' are shipped for now.
+            // The other tabs (fk_apply, entity_tags, kb, columns, schemas) are stubbed out
+            // for future release -- keep the code but hide the tabs until ready.
+            .filter(([k]) => ['editor', 'log'].includes(k))
+            .map(([k, l]) => (
+            <button key={k} onClick={() => setTab(k)}
+              className={`px-3.5 py-1.5 text-sm rounded-lg transition-all duration-200 ${tab === k ? 'bg-white dark:bg-dbx-navy-500 shadow-sm font-semibold text-dbx-lava' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>{l}</button>
+          ))}
+        </div>
+        <span className="text-[10px] text-slate-400 dark:text-slate-500">
+          {tab === 'editor' && 'Edit comments, PII flags, domains, ontology, and FK metadata per table. Use DDL Bundle below to apply.'}
+          {tab === 'log' && 'Raw generation log showing every LLM call result -- useful for debugging or auditing.'}
+        </span>
+        {!['editor', 'fk_apply', 'entity_tags'].includes(tab) && <>
+          {tab === 'schemas' && (
+            <input value={filterExtra} onChange={e => setFilterExtra(e.target.value)} placeholder="Filter by schema name..."
+              className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-48 focus:ring-2 focus:ring-orange-500" aria-label="Filter by schema name" />
+          )}
+          {(tab === 'kb' || tab === 'log') && (
+            <>
+              <input value={filterTable} onChange={e => setFilterTable(e.target.value)} placeholder="Filter by table name..."
+                className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-48 focus:ring-2 focus:ring-orange-500" aria-label="Filter by table name" />
+              {tab === 'kb' && <input value={filterExtra} onChange={e => setFilterExtra(e.target.value)} placeholder="Schema name (exact)"
+                className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-40 focus:ring-2 focus:ring-orange-500" aria-label="Filter by schema name" />}
+            </>
+          )}
+          {tab === 'columns' && (
+            <>
+              <input value={filterTable} onChange={e => setFilterTable(e.target.value)} placeholder="Filter by table name..."
+                className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-48 focus:ring-2 focus:ring-orange-500" aria-label="Filter by table name" />
+              <input value={filterExtra} onChange={e => setFilterExtra(e.target.value)} placeholder="Filter by column name..."
+                className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-48 focus:ring-2 focus:ring-orange-500" aria-label="Filter by column name" />
+            </>
+          )}
+          <button onClick={() => load(tab)} className="px-4 py-1.5 bg-dbx-oat text-slate-700 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark">Search</button>
+          {isEditable && modifiedCount > 0 && (
+            <button onClick={handleUpdate} disabled={saving}
+              className="px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 shadow-sm disabled:opacity-50">Save changes ({modifiedCount})</button>
+          )}
+        </>}
+      </div>
+      {tab === 'editor' ? <ReviewEditor /> :
+       tab === 'fk_apply' ? <FKApplyPanel /> :
+       tab === 'entity_tags' ? <EntityTagsPanel /> : (
+        <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-600 p-4 shadow-sm">
+          {loading ? <p className="text-sm text-slate-400 py-4">Loading...</p> : (
+            tab === 'log' ? <DataTable data={data} /> : (
+              tab === 'kb' ? <EditableTableKB rows={data} original={original} setRows={setData} /> :
+              tab === 'columns' ? <EditableColumnKB rows={data} original={original} setRows={setData} /> :
+              tab === 'schemas' ? <EditableSchemaKB rows={data} original={original} setRows={setData} /> : <DataTable data={data} />
+            )
+          )}
+        </div>
+      )}
+
+      {(tab === 'kb' || tab === 'columns' || tab === 'schemas') && (
+        <div className="bg-dbx-oat-light rounded-xl border border-slate-200 p-4 shadow-sm space-y-3">
+          <h3 className="text-sm font-semibold text-slate-700">Generate SQL / Apply DDL</h3>
+          <p className="text-[10px] text-amber-600">Apply DDL will execute COMMENT ON and ALTER TABLE SET TAGS statements directly on your Unity Catalog tables. Existing comments and tags will be overwritten.</p>
+          <div className="flex flex-wrap items-center gap-4">
+            <span className="text-sm text-slate-600">Scope:</span>
+            {['table', 'schema', 'column'].map(s => (
+              <label key={s} className="inline-flex items-center gap-1.5">
+                <input type="radio" name="ddlScope" checked={ddlScope === s} onChange={() => setDdlScope(s)} className="rounded border-slate-300" />
+                <span className="text-sm capitalize">{s}</span>
+              </label>
+            ))}
+            <input value={ddlIdentifiers} onChange={e => setDdlIdentifiers(e.target.value)}
+              placeholder={ddlScope === 'table' ? 'Table names (optional, comma/newline)' : ddlScope === 'schema' ? 'Schema names (optional)' : 'Column IDs or table names (optional)'}
+              className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm flex-1 min-w-[12rem] focus:ring-2 focus:ring-orange-500" />
+            <button onClick={runGenerateDdl} disabled={ddlLoading} className="px-4 py-1.5 bg-dbx-oat text-slate-700 rounded-lg text-sm font-medium hover:bg-dbx-oat-dark disabled:opacity-50">Generate SQL</button>
+            <button onClick={runApplyDdl} disabled={ddlLoading} className="px-4 py-1.5 bg-dbx-lava text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50">Apply DDL</button>
+          </div>
+          {ddlApplyResult && (ddlApplyResult.ok ? <p className="text-sm text-green-600">Applied {ddlApplyResult.applied} statement(s).</p> : <p className="text-sm text-red-600">{JSON.stringify(ddlApplyResult.detail)}</p>)}
+          {ddlSql && (
+            <div className="relative">
+              <pre className="text-xs bg-dbx-oat border border-slate-200 rounded-lg p-3 overflow-auto max-h-64 whitespace-pre-wrap">{ddlSql}</pre>
+              <button type="button" onClick={() => navigator.clipboard.writeText(ddlSql)} className="absolute top-2 right-2 px-2 py-1 bg-dbx-oat-light border border-slate-200 rounded text-xs hover:bg-dbx-oat">Copy</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

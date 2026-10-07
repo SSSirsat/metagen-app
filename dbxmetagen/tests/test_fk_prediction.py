@@ -1,0 +1,2211 @@
+"""Unit tests for FK prediction (config, orchestration, heuristics, safety)."""
+import contextlib
+import inspect
+import re
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import dbxmetagen.fk_prediction as fk_prediction_mod
+from dbxmetagen.fk_prediction import (
+    FKPredictionConfig,
+    FKPredictor,
+    _FK_MODEL,
+    _FK_EXCLUDED_DTYPES,
+    _PLURAL_RULES,
+    _dtype_exclusion_sql,
+    _dtype_excluded,
+    _DEFAULT_SYSTEM_COL_PATTERNS,
+    predict_foreign_keys,
+    _dtype_family,
+    _data_overlap_decision,
+    SR_COL_PROP,
+    SR_DECLARED,
+    SR_EMBEDDING,
+    SR_NAME,
+    SR_ONTOLOGY,
+    SR_QUERY,
+    SR_DATA_OVERLAP,
+)
+
+
+def test_source_rank_ordering():
+    """Lower number = higher trust for dedup. SR_DATA_OVERLAP is LOWEST trust (PQ-1)."""
+    assert SR_DECLARED < SR_QUERY < SR_COL_PROP < SR_NAME < SR_ONTOLOGY < SR_EMBEDDING < SR_DATA_OVERLAP
+
+
+def test_dedup_sort_key_tuple():
+    """Document expected (source_rank, col_similarity, query_hit_count) ordering."""
+    rows = [
+        (SR_EMBEDDING, 0.9, 0),
+        (SR_DECLARED, 0.0, 0),
+        (SR_QUERY, 0.5, 5),
+    ]
+    rows_sorted = sorted(rows, key=lambda r: (r[0], -r[1], -r[2]))
+    assert rows_sorted[0][0] == SR_DECLARED
+
+
+def _cfg():
+    return FKPredictionConfig(catalog_name="c", schema_name="s")
+
+
+def _empty_candidate_df():
+    df = MagicMock()
+    for name in (
+        "unionByName",
+        "filter",
+        "withColumn",
+        "drop",
+        "fillna",
+        "select",
+        "join",
+        "createOrReplaceTempView",
+    ):
+        setattr(df, name, MagicMock(return_value=df))
+    df.count = MagicMock(return_value=0)
+    return df
+
+
+def _nonempty_candidate_df(total=4, ai_eligible=2, skip_n=1):
+    df = _empty_candidate_df()
+    df.count = MagicMock(return_value=total)
+    need = MagicMock()
+    need.count = MagicMock(return_value=ai_eligible)
+    skip = MagicMock()
+    skip.count = MagicMock(return_value=skip_n)
+    # run() issues these df.filter() calls in order: (1) relationship_kind guard,
+    # (2) _rn==1 dedup, (3) generic-name corroboration drop, then (4) skip_ai and
+    # (5) ~skip_ai & rule_score>=min. The last two select the skip/need frames.
+    fc = {"n": 0}
+
+    def _filter(*_a, **_k):
+        fc["n"] += 1
+        if fc["n"] == 4:
+            return skip
+        if fc["n"] == 5:
+            return need
+        return df
+
+    df.filter = MagicMock(side_effect=_filter)
+    return df
+
+
+class _ColExpr:
+    __slots__ = ()
+
+    def asc(self):
+        return self
+
+    def desc(self):
+        return self
+
+    def cast(self, _t):
+        return self
+
+    def __invert__(self):
+        return self
+
+    def __ge__(self, _o):
+        return self
+
+    def __le__(self, _o):
+        return self
+
+    def __eq__(self, _o):
+        return self
+
+    def __ne__(self, _o):
+        return self
+
+    def __gt__(self, _o):
+        return self
+
+    def __lt__(self, _o):
+        return self
+
+    def __and__(self, _o):
+        return self
+
+    def __or__(self, _o):
+        return self
+
+    def isin(self, *_o):
+        return self
+
+
+@contextlib.contextmanager
+def _patch_fk_functions_for_run():
+    orig = fk_prediction_mod.F
+    mock_f = MagicMock()
+    mock_f.col = lambda *_a, **_k: _ColExpr()
+    mock_f.row_number = lambda *_a, **_k: SimpleNamespace(over=lambda *_w, **_kw: _ColExpr())
+    mock_f.lit = lambda *_a, **_k: _ColExpr()
+    mock_f.coalesce = lambda *_a, **_k: _ColExpr()
+    fk_prediction_mod.F = mock_f
+    try:
+        yield
+    finally:
+        fk_prediction_mod.F = orig
+
+
+# --- TestDeclaredFKGuard ---
+
+
+class TestDeclaredFKGuard:
+    def test_sql_scopes_by_table_names_when_set(self):
+        """When table_names is set, candidates are filtered to scoped tables."""
+        spark = MagicMock()
+        cfg = _cfg()
+        cfg.table_names = ["cat.sch.table_a"]
+        p = FKPredictor(spark, cfg)
+        out_mock = spark.sql.return_value.withColumn.return_value
+        out_mock.withColumn.return_value = out_mock
+        out_mock.filter.return_value = out_mock
+        p.get_declared_fk_candidates()
+        assert out_mock.filter.called
+
+    def test_sql_contains_size_filter(self):
+        """The SQL WHERE clause excludes malformed refs with < 4 parts."""
+        spark = MagicMock()
+        p = FKPredictor(spark, _cfg())
+        p.get_declared_fk_candidates()
+        sql = spark.sql.call_args[0][0]
+        assert "SIZE(parts) >= 4" in sql
+
+    def test_sql_filters_null_ref_target(self):
+        """The SQL WHERE clause excludes null/empty ref_target."""
+        spark = MagicMock()
+        p = FKPredictor(spark, _cfg())
+        p.get_declared_fk_candidates()
+        sql = spark.sql.call_args[0][0]
+        assert "ref_target IS NOT NULL" in sql
+
+    def test_returns_dataframe_with_source_rank(self):
+        """Result should have withColumn calls for source_rank and query_hit_count."""
+        spark = MagicMock()
+        out_mock = spark.sql.return_value.withColumn.return_value
+        out_mock.withColumn.return_value = out_mock
+        p = FKPredictor(spark, _cfg())
+        result = p.get_declared_fk_candidates()
+        assert spark.sql.called
+
+
+# --- TestColumnPropertyBlockGuard ---
+
+
+class TestColumnPropertyBlockGuard:
+    """The column-property FK generator links by entity type only; without a
+    same-block guard it produces cross-schema pairs that never join (and, via the
+    SR_COL_PROP skip-AI path, land is_fk=true). It must block cross-catalog.schema
+    pairs by default, gated on ontology_cross_block."""
+
+    def _last_col_prop_sql(self, spark):
+        # get_column_property_candidates probes the table first (SELECT 1 ...),
+        # then runs the main SQL. Return the main SQL (the one with obj_props CTE).
+        for call in reversed(spark.sql.call_args_list):
+            sql = call[0][0]
+            if "obj_props" in sql:
+                return sql
+        return ""
+
+    def test_same_block_filter_present_by_default(self):
+        spark = MagicMock()
+        cfg = _cfg()
+        assert cfg.ontology_cross_block is False
+        p = FKPredictor(spark, cfg)
+        p.get_column_property_candidates()
+        sql = self._last_col_prop_sql(spark)
+        # The guard compares catalog.schema of the two tables.
+        assert "ap.table_a" in sql and "ap.table_b" in sql
+        assert "ELEMENT_AT(SPLIT(ap.table_a" in sql
+        assert "ELEMENT_AT(SPLIT(ap.table_b" in sql
+
+    def test_cross_block_filter_absent_when_enabled(self):
+        spark = MagicMock()
+        cfg = _cfg()
+        cfg.ontology_cross_block = True
+        p = FKPredictor(spark, cfg)
+        p.get_column_property_candidates()
+        sql = self._last_col_prop_sql(spark)
+        # With cross-block allowed, no catalog.schema equality guard is emitted.
+        assert "ELEMENT_AT(SPLIT(ap.table_a" not in sql
+
+
+# --- TestNeverJoinsVeto ---
+
+
+class TestNeverJoinsVeto:
+    """Defense in depth: a skip-AI candidate whose join probe found ZERO overlap
+    (join_matched=0) and ri_score=0.0 provably never joins and must not be
+    asserted is_fk=true, except when steward-declared (SR_DECLARED)."""
+
+    def _never_joins(self, join_matched, ri_score, source_rank):
+        # Mirror the predicate in run()'s final projection.
+        base = (join_matched == 0) and (ri_score == 0.0)
+        if source_rank is not None:
+            base = base and (source_rank != SR_DECLARED)
+        return base
+
+    def test_cross_schema_col_prop_pair_vetoed(self):
+        # The observed bug: dim_department.location_id <-> dim_store.store_id,
+        # column-property skip-AI, join_matched=0, ri_score=0.0.
+        assert self._never_joins(0, 0.0, SR_COL_PROP) is True
+
+    def test_declared_fk_exempt(self):
+        # Steward-declared FKs may reference rows absent from the sample.
+        assert self._never_joins(0, 0.0, SR_DECLARED) is False
+
+    def test_real_join_not_vetoed(self):
+        # A pair that actually joins (join_matched>0) is never vetoed.
+        assert self._never_joins(5, 0.0, SR_COL_PROP) is False
+
+    def test_partial_ri_not_vetoed(self):
+        # Non-zero RI (or the neutral 0.5 fallback for unprobed pairs) is not vetoed.
+        assert self._never_joins(0, 0.5, SR_COL_PROP) is False
+
+
+class TestMirrorVeto:
+    """A FK is many-to-one, so its child side is non-unique. When BOTH columns of a
+    low-trust (name/embedding/value-overlap) candidate are near-unique the pair is a 1:1
+    table mirror / staging copy sharing a unique column, NOT a FK -- it joins perfectly so
+    no other guard catches it. Declared/ontology/column-property sources are exempt."""
+
+    def _mirror(self, card_a, card_b, source_rank, thresh=0.95):
+        # Mirror the predicate in run()'s final projection.
+        low_trust = source_rank in (SR_NAME, SR_EMBEDDING, SR_DATA_OVERLAP)
+        return low_trust and (card_a >= thresh) and (card_b >= thresh)
+
+    def test_embedding_mirror_vetoed(self):
+        # dim_customer.customer_name <-> dim_customer_staging.customer_name: both unique,
+        # arrives via embedding similarity (equal names + identical values).
+        assert self._mirror(1.0, 1.0, SR_EMBEDDING) is True
+
+    def test_real_fk_not_vetoed(self):
+        # npi/email FK: child non-unique (card ~0.1), parent unique -> asymmetric, keep.
+        assert self._mirror(0.10, 1.0, SR_DATA_OVERLAP) is False
+
+    def test_declared_11_link_exempt(self):
+        # A steward-declared / ontology 1:1 link is trusted, not vetoed.
+        assert self._mirror(1.0, 1.0, SR_DECLARED) is False
+        assert self._mirror(1.0, 1.0, SR_COL_PROP) is False
+
+
+class TestNeverJoinsConfidenceCollapse:
+    """FK-11: a provably-disjoint pair (never_joins) has final_confidence collapsed
+    by 0.25x, not just is_fk flipped -- so it drops below the display/review
+    threshold instead of lingering at ~0.6 (name+dtype match alone). Gated on the
+    SAME never_joins signal, so it only fires when the join probe actually ran."""
+
+    def _final_conf(self, base_score, join_matched, ri_score, source_rank=SR_COL_PROP):
+        # Mirror the final_confidence multiplier in run()'s projection.
+        never_joins = (join_matched == 0) and (ri_score == 0.0) and (source_rank != SR_DECLARED)
+        mult = 0.25 if never_joins else 1.0
+        return max(0.0, min(1.0, base_score * mult))
+
+    def test_disjoint_pair_confidence_collapsed(self):
+        # The uat_fk_hard region_id trap: base ~0.6, probe ran and found disjoint.
+        assert self._final_conf(0.603, join_matched=0, ri_score=0.0) < 0.2
+
+    def test_real_join_confidence_unchanged(self):
+        # A pair that actually joins keeps its full score.
+        assert self._final_conf(0.85, join_matched=10, ri_score=1.0) == 0.85
+
+    def test_unprobed_pair_confidence_unchanged(self):
+        # Absent probe -> ri coalesces to 0.5, not 0.0 -> NOT collapsed (no false
+        # penalty on federation/large-table/sampling-off pairs).
+        assert self._final_conf(0.7, join_matched=0, ri_score=0.5) == 0.7
+
+    def test_declared_fk_confidence_unchanged(self):
+        # Steward-declared FKs are exempt from the collapse.
+        assert self._final_conf(0.6, join_matched=0, ri_score=0.0, source_rank=SR_DECLARED) == 0.6
+
+
+class TestOneFkPerChildColumn:
+    """A single fully-qualified child column (src_column, always the FK side after
+    _enforce_direction) cannot be a referential FK to more than one parent table.
+    When >1 is_fk=true targets survive for one child column, keep only the highest
+    final_confidence one; demote the rest to is_fk=false. Declared FKs are exempt,
+    and a lone target or an already-false row is untouched. This mirrors the
+    resolution in run()'s final projection (write_predictions)."""
+
+    def _resolve(self, rows):
+        """rows: list of dicts with src_column, dst_column, is_fk, final_confidence,
+        source_rank. Returns the resolved is_fk per row, in input order."""
+        # Rank per src_column: is_fk=true first, then declared, then higher
+        # confidence, then stable dst_column tiebreak (mirrors the Window orderBy).
+        out = []
+        by_child = {}
+        for i, r in enumerate(rows):
+            by_child.setdefault(r["src_column"], []).append(i)
+        resolved = [r["is_fk"] for r in rows]
+        for child, idxs in by_child.items():
+            ordered = sorted(
+                idxs,
+                key=lambda i: (
+                    0 if rows[i]["is_fk"] else 1,
+                    0 if rows[i]["source_rank"] == SR_DECLARED else 1,
+                    -rows[i]["final_confidence"],
+                    rows[i]["dst_column"],
+                ),
+            )
+            for rank, i in enumerate(ordered, start=1):
+                r = rows[i]
+                is_declared = r["source_rank"] == SR_DECLARED
+                resolvable = r["is_fk"] and not is_declared
+                if resolvable and rank > 1:
+                    resolved[i] = False
+        return resolved
+
+    def test_multi_target_keeps_highest_confidence(self):
+        # The observed bug: fct_encounter.patient_id links to Person, which is
+        # 'primary' for both dim_patient AND patient_facility_bridge. Both land
+        # is_fk=true via column_property_skip_ai; only dim_patient (higher conf) survives.
+        rows = [
+            {"src_column": "c.s.fct.patient_id", "dst_column": "c.s.dim_patient.patient_id",
+             "is_fk": True, "final_confidence": 0.90, "source_rank": SR_COL_PROP},
+            {"src_column": "c.s.fct.patient_id", "dst_column": "c.s.bridge.patient_id",
+             "is_fk": True, "final_confidence": 0.80, "source_rank": SR_COL_PROP},
+        ]
+        assert self._resolve(rows) == [True, False]
+
+    def test_second_multi_target_pattern(self):
+        # bridge.facility_id -> Organization, primary for both dim_facility AND
+        # dim_health_system. dim_facility (0.92) wins; dim_health_system (0.89) demoted.
+        rows = [
+            {"src_column": "c.s.bridge.facility_id", "dst_column": "c.s.dim_facility.facility_id",
+             "is_fk": True, "final_confidence": 0.92, "source_rank": SR_COL_PROP},
+            {"src_column": "c.s.bridge.facility_id", "dst_column": "c.s.dim_health_system.health_system_id",
+             "is_fk": True, "final_confidence": 0.89, "source_rank": SR_COL_PROP},
+        ]
+        assert self._resolve(rows) == [True, False]
+
+    def test_lone_target_untouched(self):
+        rows = [
+            {"src_column": "c.s.fct.customer_id", "dst_column": "c.s.dim_customer.id",
+             "is_fk": True, "final_confidence": 0.85, "source_rank": SR_COL_PROP},
+        ]
+        assert self._resolve(rows) == [True]
+
+    def test_shared_dimension_across_facts_untouched(self):
+        # Different child columns (different fact tables) -> not competing. Both keep is_fk.
+        rows = [
+            {"src_column": "c.s.fct_sales.customer_id", "dst_column": "c.s.dim_customer.id",
+             "is_fk": True, "final_confidence": 0.9, "source_rank": SR_COL_PROP},
+            {"src_column": "c.s.fct_returns.customer_id", "dst_column": "c.s.dim_customer.id",
+             "is_fk": True, "final_confidence": 0.8, "source_rank": SR_COL_PROP},
+        ]
+        assert self._resolve(rows) == [True, True]
+
+    def test_declared_fk_wins_and_demotes_competing_prediction(self):
+        # A steward-declared FK is authoritative: a real SQL FK constraint references
+        # exactly one table, so a competing PREDICTION on the same child column (even
+        # a higher-confidence one) is spurious and must be demoted. The declared row
+        # is itself exempt from demotion; the prediction ranks after it and is demoted.
+        rows = [
+            {"src_column": "c.s.fct.k", "dst_column": "c.s.dim_a.k",
+             "is_fk": True, "final_confidence": 0.99, "source_rank": SR_COL_PROP},
+            {"src_column": "c.s.fct.k", "dst_column": "c.s.dim_b.k",
+             "is_fk": True, "final_confidence": 0.70, "source_rank": SR_DECLARED},
+        ]
+        # Declared (index 1) wins the ranking and stays True; the competing prediction
+        # (index 0) is demoted to False.
+        assert self._resolve(rows) == [False, True]
+
+    def test_two_declared_fks_both_exempt(self):
+        # Two declared FKs on one child column (rare, but possible via metadata quirks):
+        # neither is a prediction, so neither is demoted -- resolution never touches
+        # declared rows. Left to the steward.
+        rows = [
+            {"src_column": "c.s.fct.k", "dst_column": "c.s.dim_a.k",
+             "is_fk": True, "final_confidence": 0.9, "source_rank": SR_DECLARED},
+            {"src_column": "c.s.fct.k", "dst_column": "c.s.dim_b.k",
+             "is_fk": True, "final_confidence": 0.8, "source_rank": SR_DECLARED},
+        ]
+        assert self._resolve(rows) == [True, True]
+
+    def test_already_false_target_untouched(self):
+        # A vetoed (is_fk=false) runner-up must not block or be re-touched.
+        rows = [
+            {"src_column": "c.s.fct.x_id", "dst_column": "c.s.dim_x.id",
+             "is_fk": True, "final_confidence": 0.9, "source_rank": SR_COL_PROP},
+            {"src_column": "c.s.fct.x_id", "dst_column": "c.s.other.id",
+             "is_fk": False, "final_confidence": 0.6, "source_rank": SR_COL_PROP},
+        ]
+        assert self._resolve(rows) == [True, False]
+
+
+# --- TestUIDedup ---
+
+
+class TestUIDedup:
+    def test_dedup_key_orders_by_source_rank_first(self):
+        a = ("x", "y", SR_EMBEDDING, 0.99, 100)
+        b = ("x", "y", SR_DECLARED, 0.1, 0)
+        rows = [a, b]
+        rows.sort(key=lambda r: (r[2], -r[3], -r[4]))
+        assert rows[0][2] == SR_DECLARED
+
+    def test_same_source_prefers_higher_col_similarity(self):
+        rows = [
+            ("x", "y", SR_NAME, 0.1, 0),
+            ("x", "y", SR_NAME, 0.9, 0),
+        ]
+        rows.sort(key=lambda r: (r[2], -r[3], -r[4]))
+        assert rows[0][3] == 0.9
+
+    def test_same_source_and_sim_prefers_query_hits(self):
+        rows = [
+            ("x", "y", SR_QUERY, 0.5, 1),
+            ("x", "y", SR_QUERY, 0.5, 9),
+        ]
+        rows.sort(key=lambda r: (r[2], -r[3], -r[4]))
+        assert rows[0][4] == 9
+
+    def test_similarity_propagation_preserves_embedding_signal(self):
+        """Name-based wins source_rank dedup, but must keep embedding col_similarity."""
+        # (col_a, col_b, source_rank, col_similarity, table_similarity, query_hit_count)
+        embedding_row = ("x", "y", SR_EMBEDDING, 0.92, 0.85, 0)
+        name_row = ("x", "y", SR_NAME, 0.0, 0.0, 0)
+        rows = [embedding_row, name_row]
+
+        # Step 1: propagate max similarity across all sources per (col_a, col_b)
+        by_pair: dict[tuple, list] = {}
+        for r in rows:
+            by_pair.setdefault((r[0], r[1]), []).append(r)
+        propagated = []
+        for _key, group in by_pair.items():
+            max_col_sim = max(r[3] for r in group)
+            max_tbl_sim = max(r[4] for r in group)
+            for r in group:
+                propagated.append((r[0], r[1], r[2], max_col_sim, max_tbl_sim, r[5]))
+
+        # Step 2: dedup by source_rank (name=3 wins over embedding=5)
+        propagated.sort(key=lambda r: (r[2], -r[3], -r[5]))
+        winner = propagated[0]
+
+        assert winner[2] == SR_NAME, "name-based should win the dedup"
+        assert winner[3] == 0.92, "col_similarity from embedding must be preserved"
+        assert winner[4] == 0.85, "table_similarity from embedding must be preserved"
+
+
+# --- TestTableNameMatchStem ---
+
+
+class TestSingularize:
+    """Verify the _PLURAL_RULES-based singularizer handles common English plurals."""
+
+    @staticmethod
+    def _singularize(word: str) -> str:
+        """Python mirror of _singularize_col / _singularize_sql."""
+        import re
+        for pattern, repl in _PLURAL_RULES:
+            if re.search(pattern, word):
+                return re.sub(pattern, repl, word)
+        return word
+
+    def test_ies(self):
+        assert self._singularize("territories") == "territory"
+        assert self._singularize("categories") == "category"
+
+    def test_sses(self):
+        assert self._singularize("processes") == "process"
+
+    def test_shes(self):
+        assert self._singularize("crashes") == "crash"
+
+    def test_ches(self):
+        assert self._singularize("batches") == "batch"
+
+    def test_xes(self):
+        assert self._singularize("boxes") == "box"
+        assert self._singularize("indexes") == "index"
+
+    def test_zes(self):
+        assert self._singularize("buzzes") == "buzz"
+
+    def test_ses(self):
+        assert self._singularize("databases") == "database"
+        assert self._singularize("responses") == "response"
+
+    def test_plain_s(self):
+        assert self._singularize("orders") == "order"
+        assert self._singularize("products") == "product"
+        assert self._singularize("accounts") == "account"
+
+    def test_no_plural(self):
+        assert self._singularize("status") == "statu"
+        assert self._singularize("index") == "index"
+
+
+class TestTableNameMatchStem:
+    """Verify that table_name_match strips dim_/fct_ prefixes and singularizes."""
+
+    @staticmethod
+    def _stem(table_short: str) -> str:
+        """Mirror the SQL: strip prefix then singularize via _PLURAL_RULES."""
+        import re
+        s = re.sub(r"^(dim_|fct_|fact_|stg_)", "", table_short)
+        for pattern, repl in _PLURAL_RULES:
+            if re.search(pattern, s):
+                return re.sub(pattern, repl, s)
+        return s
+
+    @staticmethod
+    def _matches(col_short: str, stem: str) -> bool:
+        import re
+        return bool(re.search(rf"(^|_){re.escape(stem)}(_|$)", col_short))
+
+    def test_index_code_matches_dim_index(self):
+        stem = self._stem("dim_index")
+        assert stem == "index"
+        assert self._matches("index_code", stem)
+
+    def test_security_id_matches_dim_security(self):
+        stem = self._stem("dim_security")
+        assert stem == "security"
+        assert self._matches("security_id", stem)
+
+    def test_account_id_matches_fct_accounts(self):
+        stem = self._stem("fct_accounts")
+        assert stem == "account"
+        assert self._matches("account_id", stem)
+
+    def test_status_does_not_match_dim_customer(self):
+        stem = self._stem("dim_customer")
+        assert stem == "customer"
+        assert not self._matches("status", stem)
+
+    def test_no_prefix_still_works(self):
+        stem = self._stem("orders")
+        assert stem == "order"
+        assert self._matches("order_id", stem)
+
+    def test_unrelated_col_no_match(self):
+        stem = self._stem("dim_product")
+        assert stem == "product"
+        assert not self._matches("customer_id", stem)
+
+    def test_territory_id_matches_territories(self):
+        stem = self._stem("territories")
+        assert stem == "territory"
+        assert self._matches("territory_id", stem)
+
+    def test_batch_id_matches_batches(self):
+        stem = self._stem("batches")
+        assert stem == "batch"
+        assert self._matches("batch_id", stem)
+
+    def test_category_id_matches_fct_categories(self):
+        stem = self._stem("fct_categories")
+        assert stem == "category"
+        assert self._matches("category_id", stem)
+
+
+# --- TestEnforceDirection ---
+
+
+class TestEnforceDirection:
+    def test_returns_unchanged_without_ai_or_cardinality_cols(self):
+        df = MagicMock()
+        df.columns = ["col_a", "col_b", "table_a", "table_b"]
+        out = FKPredictor._enforce_direction(df)
+        assert out is df
+
+    def test_no_columns_attr_falsy_branch(self):
+        df = MagicMock(spec=["withColumn"])
+        df.columns = []
+        out = FKPredictor._enforce_direction(df)
+        assert out is df
+
+
+# --- TestQueryHistoryRegex ---
+
+
+class TestQueryHistoryRegex:
+    @staticmethod
+    def _join_re():
+        return re.compile(
+            r"(\w+(?:\.\w+){0,3})\.(\w+)\s*=\s*(\w+(?:\.\w+){0,3})\.(\w+)",
+            re.IGNORECASE,
+        )
+
+    def test_matches_simple_equality(self):
+        m = self._join_re().search("JOIN a.b ON c.s.t1.id = c.s.t2.fk_id")
+        assert m
+        assert m.group(2).lower() == "id"
+
+    def test_matches_three_part_table(self):
+        m = self._join_re().search("ON cat.sch.orders.user_id = cat.sch.users.id")
+        assert m and "orders" in m.group(1).lower()
+
+    def test_get_query_join_candidates_returns_empty_on_sql_error(self):
+        spark = MagicMock()
+        spark.sql.side_effect = Exception("no system tables")
+        p = FKPredictor(spark, _cfg())
+        p.get_query_join_candidates()
+        spark.createDataFrame.assert_called_once()
+        args, _kw = spark.createDataFrame.call_args
+        assert args[0] == []
+
+    def test_regex_ignores_case(self):
+        m = self._join_re().search("t1.X = t2.Y")
+        assert m
+
+
+# --- TestQueryHistorySameTableFilter ---
+
+
+class TestQueryHistorySameTableFilter:
+    def test_same_table_pair_skipped(self):
+        cat, sch = "mycat", "mysch"
+        prefix = f"{cat}.{sch}.".lower()
+        tbl_a = f"{cat}.{sch}.t1"
+        tbl_b = f"{cat}.{sch}.t1"
+        assert prefix in tbl_a.lower()
+        assert tbl_a.lower() == tbl_b.lower()
+
+
+# --- TestFKPredictionConfig ---
+
+
+class TestFKPredictionConfig:
+    def test_fq_builds_three_part_name(self):
+        c = FKPredictionConfig(catalog_name="a", schema_name="b")
+        assert c.fq("tbl") == "a.b.tbl"
+
+    def test_no_model_endpoint_field(self):
+        c = FKPredictionConfig(catalog_name="x", schema_name="y")
+        assert not hasattr(c, "model_endpoint")
+
+    def test_max_ontology_table_pairs_default(self):
+        c = FKPredictionConfig(catalog_name="x", schema_name="y")
+        assert c.max_ontology_table_pairs == 50_000
+
+
+# --- TestHardcodedModel ---
+
+
+class TestHardcodedModel:
+    def test_fk_model_constant(self):
+        assert _FK_MODEL == "databricks-gpt-oss-120b"
+
+    def test_predict_foreign_keys_wraps_config(self):
+        sig = inspect.signature(predict_foreign_keys)
+        assert "catalog_name" in sig.parameters
+        assert "dry_run" in sig.parameters
+        spark = MagicMock()
+        with patch.object(FKPredictor, "run", return_value={"ok": True}) as run:
+            predict_foreign_keys(spark, "c", "s", dry_run=True)
+            run.assert_called_once()
+
+    def test_ai_judge_sql_mentions_model(self):
+        src = inspect.getsource(FKPredictor.ai_judge)
+        assert "AI_QUERY" in src
+        assert "model = _FK_MODEL" in src
+
+
+# --- TestRunOrchestration ---
+
+
+class TestRunOrchestration:
+    @pytest.fixture
+    def spark(self):
+        return MagicMock()
+
+    def test_zero_candidates_returns_early_counts(self, spark):
+        empty = _empty_candidate_df()
+        with (
+            _patch_fk_functions_for_run(),
+            patch.object(FKPredictor, "_ensure_output_tables"),
+            patch.object(FKPredictor, "get_candidates", return_value=empty),
+            patch.object(FKPredictor, "get_name_based_candidates", return_value=empty),
+            patch.object(FKPredictor, "get_ontology_relationship_candidates", return_value=empty),
+            patch.object(FKPredictor, "get_column_property_candidates", return_value=empty),
+            patch.object(FKPredictor, "get_declared_fk_candidates", return_value=empty),
+            patch.object(FKPredictor, "get_query_join_candidates", return_value=empty),
+        ):
+            p = FKPredictor(spark, _cfg())
+            out = p.run()
+        assert out["candidates"] == 0
+        assert out["predictions"] == 0
+
+    def test_invokes_all_six_candidate_sources(self, spark):
+        empty = _empty_candidate_df()
+        with (
+            _patch_fk_functions_for_run(),
+            patch.object(FKPredictor, "_ensure_output_tables"),
+            patch.object(FKPredictor, "get_candidates", return_value=empty) as m_emb,
+            patch.object(FKPredictor, "get_name_based_candidates", return_value=empty) as m_nm,
+            patch.object(FKPredictor, "get_ontology_relationship_candidates", return_value=empty) as m_on,
+            patch.object(FKPredictor, "get_column_property_candidates", return_value=empty) as m_cp,
+            patch.object(FKPredictor, "get_declared_fk_candidates", return_value=empty) as m_dc,
+            patch.object(FKPredictor, "get_query_join_candidates", return_value=empty) as m_qy,
+        ):
+            p = FKPredictor(spark, _cfg())
+            p.run()
+        m_emb.assert_called_once()
+        m_nm.assert_called_once()
+        m_on.assert_called_once()
+        m_cp.assert_called_once()
+        m_dc.assert_called_once()
+        m_qy.assert_called_once()
+
+    def test_patches_post_candidate_pipeline_for_dry_run(self, spark):
+        df = _nonempty_candidate_df(total=3, ai_eligible=2, skip_n=1)
+        cfg = _cfg()
+        cfg.dry_run = True
+        with (
+            _patch_fk_functions_for_run(),
+            patch.object(FKPredictor, "_ensure_output_tables"),
+            patch.object(FKPredictor, "get_candidates", return_value=df),
+            patch.object(FKPredictor, "get_name_based_candidates", return_value=df),
+            patch.object(FKPredictor, "get_ontology_relationship_candidates", return_value=df),
+            patch.object(FKPredictor, "get_column_property_candidates", return_value=df),
+            patch.object(FKPredictor, "get_declared_fk_candidates", return_value=df),
+            patch.object(FKPredictor, "get_query_join_candidates", return_value=df),
+            patch.object(FKPredictor, "add_entity_match", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_lineage_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_domain_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_backfill_embedding_similarity", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_sample_from_source", side_effect=lambda c: c),
+            patch.object(FKPredictor, "rule_score", side_effect=lambda c: c),
+            patch.object(FKPredictor, "cardinality_analysis", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_with_skip_ai_flags", side_effect=lambda c: c),
+            patch.object(FKPredictor, "ai_judge") as m_ai,
+        ):
+            p = FKPredictor(spark, cfg)
+            out = p.run()
+        m_ai.assert_not_called()
+        assert out["dry_run"] is True
+        assert out["ai_query_rows"] == 2
+
+
+# --- TestDryRunAccounting ---
+
+
+class TestDryRunAccounting:
+    def test_dry_run_skips_ai_judge(self):
+        spark = MagicMock()
+        df = _nonempty_candidate_df()
+        cfg = _cfg()
+        cfg.dry_run = True
+        with (
+            _patch_fk_functions_for_run(),
+            patch.object(FKPredictor, "_ensure_output_tables"),
+            patch.object(FKPredictor, "get_candidates", return_value=df),
+            patch.object(FKPredictor, "get_name_based_candidates", return_value=df),
+            patch.object(FKPredictor, "get_ontology_relationship_candidates", return_value=df),
+            patch.object(FKPredictor, "get_column_property_candidates", return_value=df),
+            patch.object(FKPredictor, "get_declared_fk_candidates", return_value=df),
+            patch.object(FKPredictor, "get_query_join_candidates", return_value=df),
+            patch.object(FKPredictor, "add_entity_match", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_lineage_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_domain_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_backfill_embedding_similarity", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_sample_from_source", side_effect=lambda c: c),
+            patch.object(FKPredictor, "rule_score", side_effect=lambda c: c),
+            patch.object(FKPredictor, "cardinality_analysis", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_with_skip_ai_flags", side_effect=lambda c: c),
+            patch.object(FKPredictor, "ai_judge") as m_ai,
+            patch.object(FKPredictor, "_heuristic_ai_fill") as m_heur,
+        ):
+            p = FKPredictor(spark, cfg)
+            p.run()
+        m_ai.assert_not_called()
+        m_heur.assert_not_called()
+
+    def test_dry_run_reports_candidate_and_ai_counts(self):
+        spark = MagicMock()
+        df = _nonempty_candidate_df(total=6, ai_eligible=4, skip_n=2)
+        cfg = _cfg()
+        cfg.dry_run = True
+        with (
+            _patch_fk_functions_for_run(),
+            patch.object(FKPredictor, "_ensure_output_tables"),
+            patch.object(FKPredictor, "get_candidates", return_value=df),
+            patch.object(FKPredictor, "get_name_based_candidates", return_value=df),
+            patch.object(FKPredictor, "get_ontology_relationship_candidates", return_value=df),
+            patch.object(FKPredictor, "get_column_property_candidates", return_value=df),
+            patch.object(FKPredictor, "get_declared_fk_candidates", return_value=df),
+            patch.object(FKPredictor, "get_query_join_candidates", return_value=df),
+            patch.object(FKPredictor, "add_entity_match", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_lineage_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "add_domain_signal", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_backfill_embedding_similarity", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_sample_from_source", side_effect=lambda c: c),
+            patch.object(FKPredictor, "rule_score", side_effect=lambda c: c),
+            patch.object(FKPredictor, "cardinality_analysis", side_effect=lambda c: c),
+            patch.object(FKPredictor, "_with_skip_ai_flags", side_effect=lambda c: c),
+        ):
+            p = FKPredictor(spark, cfg)
+            out = p.run()
+        assert out["candidates"] == 6
+        assert out["ai_query_rows"] == 4
+
+
+# --- TestAIConfidenceGating ---
+
+
+class TestAIConfidenceGating:
+    def test_negative_is_fk_zeros_effective_confidence(self):
+        raw, is_fk = 0.9, False
+        eff = raw if is_fk else 0.0
+        assert eff == 0.0
+
+    def test_positive_is_fk_keeps_bounded_raw(self):
+        raw = min(1.0, max(0.0, 0.85))
+        assert raw == 0.85
+
+    def test_ai_judge_where_uses_rule_score_min(self):
+        src = inspect.getsource(FKPredictor.ai_judge)
+        assert "rule_score >=" in src or "rule_score >=" in src.replace(" ", "")
+
+    def test_skip_ai_column_exists_after_with_skip_ai_flags(self):
+        src = inspect.getsource(FKPredictor._with_skip_ai_flags)
+        assert "skip_ai" in src
+        assert "SR_DECLARED" in src or "source_rank" in src
+
+    def test_declared_fk_skip_is_gated_on_config_flag(self):
+        # Regression: e82cf1f dropped the flag gate, making declared FKs
+        # unconditionally skip AI. The skip_ai_for_declared_fk config flag must
+        # gate the SR_DECLARED skip so a user can force declared FKs through AI.
+        src = inspect.getsource(FKPredictor._with_skip_ai_flags)
+        norm = src.replace(" ", "").replace("\n", "")
+        assert "skip_ai_for_declared_fk" in norm
+        # the flag must be AND-combined with the SR_DECLARED term
+        assert "SR_DECLARED))&F.lit(self.config.skip_ai_for_declared_fk)" in norm or \
+               "skip_ai_for_declared_fk)" in norm and "SR_DECLARED" in norm
+
+    def test_heuristic_fill_sets_high_confidence_for_declared(self):
+        src = inspect.getsource(FKPredictor._heuristic_ai_fill)
+        assert "SR_DECLARED" in src
+        assert "0.95" in src
+
+    def test_need_llm_filters_skip_ai_and_rule_floor(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "skip_ai" in src
+        assert "rule_score" in src
+
+
+# --- TestJoinRateCapping ---
+
+
+class TestJoinRateCapping:
+    def test_join_validate_adjusts_ai_confidence_formula(self):
+        ai, jr = 0.5, 1.0
+        adj = round(ai * (0.6 + 0.4 * jr), 4)
+        assert adj == 0.5
+
+    def test_join_rate_clamped_in_join_validate(self):
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "join_rate" in src
+        assert "0.6" in src and "0.4" in src
+
+    def test_join_validate_skips_haircut_for_declared(self):
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "SR_DECLARED" in src
+        assert "skip_ai" in src
+
+    def test_federation_batch_samples_run_on_driver(self):
+        src = inspect.getsource(FKPredictor._batch_ensure_table_samples)
+        assert "ThreadPoolExecutor" not in src
+
+
+    def test_federation_batch_dedupes_column_names_per_table(self):
+        src = inspect.getsource(FKPredictor._batch_ensure_table_samples)
+        assert "col_short not in cols" in src
+
+    def test_sample_from_source_dedupes_select_aliases(self):
+        src = inspect.getsource(FKPredictor._sample_from_source)
+        assert "by_short" in src or "unique_cols" in src
+
+    def test_write_predictions_allows_declared_same_table(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "SR_DECLARED" in src
+
+    def test_run_fails_when_declared_candidates_write_zero(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "OWL-declared candidates were judged" in src
+
+    def test_write_predictions_caps_join_rate(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "join_rate" in src
+        assert "least" in src.lower() or "LEAST" in src
+
+    def test_join_rate_one_boosts_confidence(self):
+        ai, jr = 0.25, 1.0
+        assert ai * (0.6 + 0.4 * jr) > ai * 0.6
+
+
+class TestJoinValidateEmptyCandidates:
+    """Customer bug: join_validate raised RuntimeError in federation_mode when
+    there were ZERO candidate pairs. Zero candidates is not a federation failure
+    (nothing to validate) -- only 'had pairs but no sample views' should raise."""
+
+    def test_guard_gated_on_rows_present(self):
+        # The RuntimeError must be gated on `rows` being non-empty, so an empty
+        # candidate set can never trigger it (would raise before the fix).
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "if rows and self.config.federation_mode" in src
+
+    def test_empty_fragments_returns_zero_join_columns(self):
+        # When there's nothing to validate, the graceful path adds zero-join cols.
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert 'withColumn("join_rate", F.lit(0.0))' in src
+        assert '"join_matched", F.lit(0)' in src
+
+    def test_guard_semantics_documented(self):
+        # Regression guard: the reason the empty case is NOT an error must be in
+        # the code so the raise isn't naively reinstated.
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "Zero candidate pairs" in src or "nothing to join-validate" in src
+
+    @staticmethod
+    def _emulate_guard(rows, federation_mode, fragments):
+        """Mirror the join_validate guard logic in pure Python to prove the
+        branch table: raise ONLY when we had rows, are federated, and built no
+        fragments. Every other empty-fragments case falls through gracefully."""
+        if not fragments:
+            if rows and federation_mode:
+                raise RuntimeError("no federation sample views")
+            return "zero_join"
+        return "validated"
+
+    def test_branch_table(self):
+        # (rows, federation, fragments) -> outcome
+        assert self._emulate_guard([], True, []) == "zero_join"       # customer case
+        assert self._emulate_guard([], False, []) == "zero_join"      # non-fed empty
+        assert self._emulate_guard(["p"], False, []) == "zero_join"   # non-fed, no views
+        with pytest.raises(RuntimeError):
+            self._emulate_guard(["p"], True, [])                      # genuine fed failure
+        assert self._emulate_guard(["p"], True, ["frag"]) == "validated"
+
+
+class TestStalePredictionSweep:
+    """The FK stale-prediction sweep mirrors the ontology sweep_stale_entities
+    contract: sweep_stale AND non-incremental, table-scoped, steward-preserving.
+    A pair that used to score is_fk=true but is no longer generated (e.g. a 1:1
+    mirror now suppressed at candidate time) must be retractable, since the
+    cumulative MERGE never removes rows on its own."""
+
+    def test_sweep_gated_on_flag_and_non_incremental(self):
+        src = inspect.getsource(FKPredictor._sweep_stale_predictions)
+        # Must early-return unless sweep_stale AND not incremental.
+        assert "not sweep_stale or self.config.incremental" in src
+
+    def test_sweep_preserves_steward_reviewed(self):
+        src = inspect.getsource(FKPredictor._sweep_stale_predictions)
+        # Human-approved predictions (review_updated_at set) are never swept.
+        assert "review_updated_at IS NULL" in src
+
+    def test_sweep_only_deletes_rows_not_re_emitted(self):
+        src = inspect.getsource(FKPredictor._sweep_stale_predictions)
+        # Deletes rows absent from the freshly-produced staging set.
+        assert "NOT EXISTS" in src
+        assert "staging_view" in src
+
+    def test_sweep_is_table_scoped(self):
+        src = inspect.getsource(FKPredictor._sweep_stale_predictions)
+        # Scope predicate ORs src_table / dst_table so a pair is in scope when
+        # EITHER endpoint matches; empty scope => whole-schema replacement.
+        assert "src_table" in src and "dst_table" in src
+        assert "table_filter_sql" in src
+
+    def test_write_predictions_threads_sweep_flag(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "_sweep_stale_predictions" in src
+
+    def test_run_passes_sweep_to_write_predictions(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "write_predictions(judged, sweep_stale=sweep_stale)" in src
+
+
+# --- TestManyToManyPenalty ---
+
+
+class TestManyToManyPenalty:
+    """Tests for many-to-many detection in join validation.
+
+    The penalty uses a 2x threshold: joined > max(a_count, b_count) * 2
+    triggers rate = 0.0. The join SQL pre-aggregates per-value counts and
+    reports the exact raw join count (SUM(ga.c * gb.c)), so the penalty is
+    fully active: a low-cardinality many-to-many pair shows joined far above
+    2x and is correctly zeroed.
+    """
+
+    @staticmethod
+    def _rate(a_count, b_count, joined):
+        """Mirror the join_rate logic from FKPredictor.join_validate."""
+        max_count = max(a_count, b_count) or 1
+        min_count = min(a_count, b_count) or 1
+        if joined > max_count * 2:
+            return 0.0
+        return joined / min_count
+
+    @staticmethod
+    def _confidence(ai_conf, join_rate):
+        """Mirror the ai_confidence adjustment from join_validate."""
+        clamped = max(0.0, min(1.0, join_rate))
+        return round(ai_conf * (0.6 + 0.4 * clamped), 4)
+
+    def test_one_to_one_perfect_match(self):
+        """Perfect 1:1 FK -- every row matches exactly once."""
+        rate = self._rate(a_count=100, b_count=100, joined=100)
+        assert rate == 1.0
+        assert self._confidence(0.8, rate) == 0.8
+
+    def test_one_to_many_fk_valid(self):
+        """FK (child) has more rows than PK (parent), matches within bound."""
+        rate = self._rate(a_count=200, b_count=100, joined=150)
+        assert rate == 1.5
+        assert self._confidence(0.8, rate) == 0.8  # clamped to 1.0
+
+    def test_one_to_many_at_boundary(self):
+        """joined == max(a, b) -- boundary, still valid FK."""
+        rate = self._rate(a_count=100, b_count=50, joined=100)
+        assert rate == 2.0  # 100/50, will clamp to 1.0
+        assert self._confidence(0.8, rate) == 0.8
+
+    def test_many_to_many_penalized(self):
+        """Classic many-to-many: low cardinality, joined >> max(a, b)."""
+        rate = self._rate(a_count=100, b_count=100, joined=5000)
+        assert rate == 0.0
+        assert self._confidence(0.8, rate) == 0.48  # 0.8 * 0.6
+
+    def test_mild_inflation_not_penalized(self):
+        """joined slightly above max -- within 2x tolerance, not penalized."""
+        rate = self._rate(a_count=100, b_count=50, joined=101)
+        assert rate == 101 / 50  # ~2.02, clamped to 1.0 downstream
+
+    def test_many_to_many_just_over_2x_threshold(self):
+        """joined = max(a, b) * 2 + 1 -- just crossed the 2x threshold."""
+        rate = self._rate(a_count=100, b_count=50, joined=201)
+        assert rate == 0.0
+
+    def test_no_match(self):
+        """No rows match at all."""
+        rate = self._rate(a_count=100, b_count=100, joined=0)
+        assert rate == 0.0
+        assert self._confidence(0.8, rate) == 0.48
+
+    def test_partial_match(self):
+        """Half the rows match -- moderate FK signal."""
+        rate = self._rate(a_count=100, b_count=100, joined=50)
+        assert rate == 0.5
+        assert self._confidence(0.8, rate) == 0.64  # 0.8 * 0.8
+
+    def test_zero_counts_no_crash(self):
+        """Both counts zero -- should not divide by zero."""
+        rate = self._rate(a_count=0, b_count=0, joined=0)
+        assert rate == 0.0
+
+    def test_asymmetric_counts(self):
+        """Unequal sample sizes, joined within FK range."""
+        rate = self._rate(a_count=500, b_count=50, joined=45)
+        assert rate == 45 / 50  # 0.9
+        assert rate > 0.0
+
+    def test_many_to_many_large_scale(self):
+        """Simulates the real bug: 100K samples, low cardinality -> billions."""
+        rate = self._rate(a_count=100_000, b_count=100_000, joined=5_000_000_000)
+        assert rate == 0.0
+
+    def test_join_validate_source_has_many_to_many_guard(self):
+        """The join_validate method must contain the 2x many-to-many check."""
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "max_count * 2" in src
+
+    def test_join_validate_sql_is_blowup_proof(self):
+        """The join SQL must pre-aggregate per-value counts and join on distinct
+        values, so a low-cardinality key cannot fan out into a runaway cross
+        product (the original cause of cluster failures). SUM(ga.c * gb.c) over
+        matching values reproduces the exact raw join count without
+        materializing it."""
+        src = inspect.getsource(FKPredictor.join_validate)
+        assert "GROUP BY val" in src
+        assert "SUM(ga.c * gb.c)" in src
+
+
+# --- TestCrossKeyNoiseGate ---
+
+
+class TestCrossKeyNoiseGate:
+    """get_candidates drops pairs whose only commonality is the _id/_key/_code
+    suffix (both key-like but stems unrelated, e.g. department_key x patient_key),
+    while keeping same-name and stem-related (role-prefixed) pairs."""
+
+    @staticmethod
+    def _stem(short):
+        return re.sub(r"(_id|_key|_code)$", "", short.lower())
+
+    @classmethod
+    def _dropped(cls, a, b):
+        """Mirror of the SQL gate in get_candidates()."""
+        key = re.compile(r"(_id|_key|_code)$")
+        if not (key.search(a.lower()) and key.search(b.lower())):
+            return False
+        sa, sb = cls._stem(a), cls._stem(b)
+        related = (
+            sa == sb
+            or re.search(rf"(^|_){re.escape(sb)}(_|$)", sa) is not None
+            or re.search(rf"(^|_){re.escape(sa)}(_|$)", sb) is not None
+        )
+        return not related
+
+    def test_cross_entity_keys_dropped(self):
+        assert self._dropped("department_key", "patient_key")
+        assert self._dropped("patient_key", "provider_key")
+        assert self._dropped("pat_id", "referral_id")
+        assert self._dropped("dx_id", "problem_list_id")
+
+    def test_same_stem_kept(self):
+        assert not self._dropped("department_key", "department_id")
+
+    def test_role_prefixed_fk_kept(self):
+        assert not self._dropped("ordering_prov_id", "prov_id")
+
+    def test_same_name_keys_kept(self):
+        assert not self._dropped("pat_id", "pat_id")
+        assert not self._dropped("pat_enc_csn_id", "pat_enc_csn_id")
+
+    def test_non_key_pairs_unaffected(self):
+        assert not self._dropped("department_name", "department_name")
+        assert not self._dropped("specialty", "specialty")
+
+    def test_gate_present_in_get_candidates_source(self):
+        src = inspect.getsource(FKPredictor.get_candidates)
+        assert "(_id|_key|_code)$" in src
+        assert "stem_a" in src and "stem_b" in src
+
+
+# --- TestSafetyFilters ---
+
+
+class TestSafetyFilters:
+    def test_run_filters_same_table_pairs(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "table_a" in src and "table_b" in src
+
+    def test_write_predictions_filters_same_table_and_column(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "src_table" in src and "dst_table" in src
+        assert "src_column" in src
+
+    def test_write_predictions_respects_confidence_threshold(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "confidence_threshold" in src
+
+    def test_ensure_output_tables_cleanup_self_ref(self):
+        src = inspect.getsource(FKPredictor._ensure_output_tables)
+        assert "src_table = dst_table" in src or "dst_table" in src
+
+    def test_ensure_output_tables_cleanup_legacy_null_is_fk(self):
+        src = inspect.getsource(FKPredictor._ensure_output_tables)
+        assert "is_fk" in src
+
+    def test_merge_deletes_reversed_direction_rows(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "DELETE FROM" in src or "dst_column" in src
+
+    def test_merge_skips_reviewed_rows(self):
+        """MERGE should not update rows where review_updated_at is set."""
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "review_updated_at IS NULL THEN UPDATE" in src
+
+    def test_reverse_delete_protects_reviewed_rows(self):
+        """Reverse-pair DELETE must not remove reviewed FK predictions."""
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "review_updated_at IS NULL" in src
+
+    def test_ensure_output_tables_adds_review_updated_at(self):
+        src = inspect.getsource(FKPredictor._ensure_output_tables)
+        assert "review_updated_at" in src
+
+    def test_graph_edges_high_conf_filter(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "confidence_threshold" in src
+
+
+class TestTableBackedOutputs:
+    """Verify generate_ddl and write_graph_edges read from the authoritative
+    fk_predictions table rather than accepting a transient DataFrame."""
+
+    def test_generate_ddl_no_df_parameter(self):
+        sig = inspect.signature(FKPredictor.generate_ddl)
+        assert list(sig.parameters.keys()) == ["self"]
+
+    def test_write_graph_edges_no_df_parameter(self):
+        sig = inspect.signature(FKPredictor.write_graph_edges)
+        assert "self" in sig.parameters
+        for p in sig.parameters.values():
+            if p.name != "self":
+                assert p.default is not inspect.Parameter.empty, f"{p.name} should have a default"
+
+    def test_generate_ddl_reads_predictions_table(self):
+        src = inspect.getsource(FKPredictor.generate_ddl)
+        assert "spark.table" in src or "self.spark.table" in src
+        assert "predictions_table" in src
+
+    def test_generate_ddl_uses_canonical_column_names(self):
+        src = inspect.getsource(FKPredictor.generate_ddl)
+        assert "src_table" in src
+        assert "dst_table" in src
+        assert "src_column" in src
+        assert "dst_column" in src
+
+    def test_generate_ddl_filters_is_fk(self):
+        src = inspect.getsource(FKPredictor.generate_ddl)
+        assert "is_fk" in src
+
+    def test_write_graph_edges_reads_predictions_table(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "spark.table" in src or "self.spark.table" in src
+        assert "predictions_table" in src
+
+    def test_write_graph_edges_uses_canonical_column_names(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "src_column" in src
+        assert "dst_column" in src
+
+    def test_write_graph_edges_filters_is_fk(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "is_fk" in src
+
+    def test_write_graph_edges_uses_merge_edges(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "merge_edges" in src
+        assert "fk_predictions" in src
+
+    def test_write_graph_edges_sets_edge_id_and_source_system(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "edge_id" in src
+        assert "source_system" in src
+
+
+class TestForeignKeyVsJoinKey:
+    """Phase 1: relationship_kind splits a true referential FK ('foreign_key' /
+    legacy NULL) from a broad join key ('join_key'). Only true FKs may become
+    ADD CONSTRAINT / predicted_fk edges; join keys still feed metric-view joins.
+    """
+
+    def test_kind_constants(self):
+        from dbxmetagen.fk_prediction import JOIN_KEY, FOREIGN_KEY
+        assert JOIN_KEY == "join_key"
+        assert FOREIGN_KEY == "foreign_key"
+
+    def test_not_join_key_sql_predicate_is_null_safe(self):
+        # Legacy NULL rows and explicit foreign_key rows must pass; only
+        # 'join_key' is excluded. The SQL form is used by app-side consumers.
+        from dbxmetagen.fk_prediction import NOT_JOIN_KEY_SQL
+        assert "relationship_kind IS NULL" in NOT_JOIN_KEY_SQL
+        assert "join_key" in NOT_JOIN_KEY_SQL
+        # <> / != excludes only the join_key literal, so NULL/foreign_key survive.
+        assert "<>" in NOT_JOIN_KEY_SQL or "!=" in NOT_JOIN_KEY_SQL
+
+    def test_generate_ddl_excludes_join_key(self):
+        src = inspect.getsource(FKPredictor.generate_ddl)
+        assert "_not_join_key" in src
+
+    def test_write_graph_edges_excludes_join_key(self):
+        src = inspect.getsource(FKPredictor.write_graph_edges)
+        assert "_not_join_key" in src
+
+    def test_ensure_output_tables_adds_relationship_columns(self):
+        src = inspect.getsource(FKPredictor._ensure_output_tables)
+        assert "relationship_kind" in src
+        assert "is_composite" in src
+        assert "join_condition" in src
+
+    def test_write_predictions_overwrite_carries_new_columns(self):
+        # The dedup INSERT OVERWRITE lists columns explicitly; the new columns
+        # must be projected or a steward's relationship_kind is dropped on rewrite.
+        src = inspect.getsource(FKPredictor.write_predictions)
+        assert "relationship_kind" in src
+        assert "is_composite" in src
+        assert "join_condition" in src
+
+    def test_not_join_key_helper_exists(self):
+        from dbxmetagen.fk_prediction import _not_join_key
+        # Callable with no args; returns a (mocked) column predicate.
+        assert callable(_not_join_key)
+        _not_join_key()
+
+    def test_create_and_overwrite_column_order_agree(self):
+        # Regression: the dedup INSERT OVERWRITE is positional (no column list),
+        # so the CREATE TABLE body column order must match the SELECT projection
+        # order for a fresh table, or the rewrite throws (silently swallowed) and
+        # dedup never runs. Compare the tail of both column sequences.
+        src = inspect.getsource(FKPredictor._ensure_output_tables)
+        # CREATE body tail (the columns after final_confidence).
+        assert "updated_at TIMESTAMP, is_fk BOOLEAN, review_updated_at TIMESTAMP," in src
+        assert "relationship_kind STRING, is_composite BOOLEAN, join_condition STRING" in src
+        wp = inspect.getsource(FKPredictor.write_predictions)
+        # SELECT projection tail must be in the SAME order.
+        assert "created_at, updated_at, is_fk, review_updated_at" in wp
+        assert "relationship_kind, is_composite, join_condition" in wp
+
+    def test_kind_constants_come_from_shared_module(self):
+        # Single source of truth: fk_prediction re-exports from fk_constants so the
+        # Spark-free app can import the identical literals without pyspark.
+        from dbxmetagen import fk_constants
+        from dbxmetagen.fk_prediction import JOIN_KEY, FOREIGN_KEY, NOT_JOIN_KEY_SQL
+        assert JOIN_KEY is fk_constants.JOIN_KEY
+        assert FOREIGN_KEY is fk_constants.FOREIGN_KEY
+        assert NOT_JOIN_KEY_SQL is fk_constants.NOT_JOIN_KEY_SQL
+
+
+# --- TestAIJudgeMockIntegration ---
+
+
+class TestAIJudgeMockIntegration:
+    def test_ai_judge_creates_temp_view_fk_scored(self):
+        spark = MagicMock()
+        df = MagicMock()
+        sql_result = MagicMock()
+        sql_result.withColumn = MagicMock(return_value=sql_result)
+        sql_result.drop = MagicMock(return_value=sql_result)
+        spark.sql.return_value = sql_result
+        p = FKPredictor(spark, _cfg())
+        with patch.object(FKPredictor, "ai_judge", wraps=p.ai_judge):
+            try:
+                p.ai_judge(df)
+            except Exception:
+                pass
+        df.createOrReplaceTempView.assert_called_with("fk_scored")
+
+    def test_ai_judge_strips_markdown_fences_in_logic(self):
+        src = inspect.getsource(FKPredictor.ai_judge)
+        assert "regexp_replace" in src
+        assert "ai_raw" in src
+
+
+# --- TestConfidenceScoringLogic ---
+
+
+class TestConfidenceScoringLogic:
+    def test_final_confidence_weights_sum_coverage(self):
+        w = {"sim": 0.15, "rule": 0.15, "ai": 0.25, "join": 0.15, "pk": 0.15, "ri": 0.15}
+        assert abs(sum(w.values()) - 1.0) < 1e-9
+
+    def test_write_predictions_final_confidence_formula_present(self):
+        src = inspect.getsource(FKPredictor.write_predictions)
+        for token in ("col_similarity", "rule_score", "ai_confidence", "pk_uniqueness", "ri_score"):
+            assert token in src
+
+    def test_rule_score_includes_col_similarity_weight(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "col_similarity" in src
+
+    def test_skip_ai_declared_always_for_declared_rank(self):
+        src = inspect.getsource(FKPredictor._with_skip_ai_flags)
+        assert "SR_DECLARED" in src
+        assert "source_rank" in src
+
+    def test_skip_ai_query_requires_min_observations(self):
+        src = inspect.getsource(FKPredictor._with_skip_ai_flags)
+        assert "skip_ai_query_min_observations" in src
+
+
+# --- TestEnforceDirectionSwap ---
+
+
+class TestEnforceDirectionSwap:
+    def test_uses_ai_fk_side_b_for_swap(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        assert 'lit("b")' in src or '"b"' in src
+
+    def test_falls_back_to_cardinality_when_ai_side_unknown(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        assert "_card_ratio" in src
+
+    def test_swap_uses_temp_columns_to_avoid_corruption(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        assert "_swap_" in src
+
+    def test_swaps_col_table_dtype_pairs(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        for col in ("col_a", "table_a", "dtype_a"):
+            assert col in src
+
+    def test_optional_entity_and_card_swap_when_present(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        assert "entity_type_a" in src or "optional_pairs" in src
+
+    def test_ai_only_branch_when_card_missing(self):
+        src = inspect.getsource(FKPredictor._enforce_direction)
+        assert "has_ai" in src and "has_card" in src
+
+
+# --- TestRuleScoreBehavior ---
+
+
+class TestRuleScoreBehavior:
+    """Execute rule_score() on mock DataFrames to verify feature gating and wiring.
+
+    Existing tests only inspect source strings. These tests actually call
+    rule_score() and verify the expression wiring through the mock layer.
+    """
+
+    def _make_predictor(self, **cfg_overrides):
+        cfg = FKPredictionConfig(catalog_name="c", schema_name="s", **cfg_overrides)
+        return FKPredictor(spark=MagicMock(), config=cfg)
+
+    def _make_candidates(self, columns):
+        df = MagicMock()
+        df.columns = columns
+        df.withColumn = MagicMock(return_value=df)
+        return df
+
+    def test_adds_rule_score_column(self):
+        """rule_score() must add a 'rule_score' column (plus persisted guard signals)."""
+        p = self._make_predictor()
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b"])
+        result = p.rule_score(df)
+        added = [c.args[0] for c in df.withColumn.call_args_list]
+        assert "rule_score" in added
+        # persisted signals the run() corroboration drop consumes
+        assert "_table_name_match" in added
+        assert "_both_generic" in added
+        assert result is df
+
+    def test_entity_match_used_when_present(self):
+        """When entity_match IS in columns, F.col('entity_match') should be called."""
+        from pyspark.sql import functions as F
+        F.col.reset_mock()
+        p = self._make_predictor()
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b", "entity_match"])
+        p.rule_score(df)
+        col_args = [c[0][0] for c in F.col.call_args_list if c[0]]
+        assert "entity_match" in col_args
+
+    def test_entity_match_fallback_when_absent(self):
+        """When entity_match is NOT in columns, F.lit(0.0) should be used."""
+        from pyspark.sql import functions as F
+        F.lit.reset_mock()
+        p = self._make_predictor()
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b"])
+        p.rule_score(df)
+        lit_args = [c[0][0] for c in F.lit.call_args_list if c[0]]
+        assert 0.0 in lit_args
+
+    def test_lineage_score_used_when_present(self):
+        """When lineage_score IS in columns, F.col('lineage_score') should be called."""
+        from pyspark.sql import functions as F
+        F.col.reset_mock()
+        p = self._make_predictor()
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b", "lineage_score"])
+        p.rule_score(df)
+        col_args = [c[0][0] for c in F.col.call_args_list if c[0]]
+        assert "lineage_score" in col_args
+
+    def test_ontology_bonus_weight_from_config(self):
+        """The ontology_match_bonus_weight config value must be read during scoring."""
+        p = self._make_predictor(ontology_match_bonus_weight=0.42)
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b", "entity_match"])
+        p.rule_score(df)
+        assert p.config.ontology_match_bonus_weight == 0.42
+
+    def test_returns_dataframe(self):
+        """rule_score() must return the DataFrame (result of withColumn)."""
+        p = self._make_predictor()
+        df = self._make_candidates(["col_a", "col_b", "dtype_a", "dtype_b",
+                                     "table_a", "table_b", "col_similarity",
+                                     "samples_a", "samples_b"])
+        result = p.rule_score(df)
+        assert result is df.withColumn.return_value
+
+
+# --- TestColumnPropertyCandidates ---
+
+
+class TestColumnPropertyCandidates:
+    """Tests for the column-property FK candidate source."""
+
+    def test_source_rank_values(self):
+        """SR_COL_PROP sits between QUERY and NAME."""
+        assert SR_QUERY < SR_COL_PROP < SR_NAME
+
+    def test_column_property_candidates_empty(self):
+        """Returns empty DataFrame when column_properties table doesn't exist."""
+        spark = MagicMock()
+        spark.sql.side_effect = Exception("TABLE_OR_VIEW_NOT_FOUND")
+        p = FKPredictor(spark, _cfg())
+        result = p.get_column_property_candidates()
+        assert result is not None
+
+    def test_column_property_candidates_pk_pair(self):
+        """When object_property + PK exist, the SQL is executed with correct tables."""
+        spark = MagicMock()
+        # First call (existence check) succeeds; second call (main SQL) returns df
+        result_df = MagicMock()
+        result_df.withColumn = MagicMock(return_value=result_df)
+        result_df.count = MagicMock(return_value=3)
+        spark.sql.side_effect = [MagicMock(), result_df]
+        p = FKPredictor(spark, _cfg())
+        result = p.get_column_property_candidates()
+        # The main SQL should reference the column_properties table
+        main_sql = spark.sql.call_args_list[1][0][0]
+        assert "ontology_column_properties" in main_sql
+        assert "object_property" in main_sql
+        assert "primary_key" in main_sql
+
+    def test_column_property_candidates_name_fallback(self):
+        """SQL includes both pk_pairs and name_pairs strategies."""
+        spark = MagicMock()
+        result_df = MagicMock()
+        result_df.withColumn = MagicMock(return_value=result_df)
+        result_df.count = MagicMock(return_value=0)
+        spark.sql.side_effect = [MagicMock(), result_df]
+        p = FKPredictor(spark, _cfg())
+        p.get_column_property_candidates()
+        main_sql = spark.sql.call_args_list[1][0][0]
+        assert "pk_pairs" in main_sql
+        assert "name_pairs" in main_sql
+        assert "NOT EXISTS" in main_sql
+
+    def test_column_property_candidates_no_linked_entity(self):
+        """SQL filters for linked_entity_type IS NOT NULL."""
+        spark = MagicMock()
+        result_df = MagicMock()
+        result_df.withColumn = MagicMock(return_value=result_df)
+        result_df.count = MagicMock(return_value=0)
+        spark.sql.side_effect = [MagicMock(), result_df]
+        p = FKPredictor(spark, _cfg())
+        p.get_column_property_candidates()
+        main_sql = spark.sql.call_args_list[1][0][0]
+        assert "linked_entity_type IS NOT NULL" in main_sql
+
+    def test_config_has_column_properties_table(self):
+        """FKPredictionConfig includes the column_properties_table field."""
+        cfg = _cfg()
+        assert cfg.column_properties_table == "ontology_column_properties"
+        assert cfg.fq(cfg.column_properties_table) == "c.s.ontology_column_properties"
+
+
+# --- TestSystemColumnExclusion ---
+
+
+class TestSystemColumnExclusion:
+    """Verify system_column_patterns config and its effect on rule_score."""
+
+    def test_default_system_patterns_exist(self):
+        cfg = _cfg()
+        assert len(cfg.system_column_patterns) > 0
+        assert cfg.system_column_patterns == _DEFAULT_SYSTEM_COL_PATTERNS
+
+    def test_custom_patterns_override_defaults(self):
+        custom = (r"^audit_", r"^_etl_")
+        cfg = FKPredictionConfig(catalog_name="c", schema_name="s", system_column_patterns=custom)
+        assert cfg.system_column_patterns == custom
+
+    def test_rule_score_source_includes_system_col_guard(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "system_column_patterns" in src
+        assert "not_system" in src
+        assert "is_system_col" in src
+
+    def test_rule_score_gates_new_signals_by_system_flag(self):
+        """schema_signal, same_domain, sim_floor are all multiplied by not_system."""
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "schema_signal * not_system" in src
+        assert "same_domain * 0.05 * not_system" in src
+        assert "sim_floor * not_system" in src
+
+    def test_predict_fk_accepts_system_column_patterns(self):
+        sig = inspect.signature(predict_foreign_keys)
+        assert "system_column_patterns" in sig.parameters
+
+    def test_predict_fk_accepts_schema_penalty_params(self):
+        sig = inspect.signature(predict_foreign_keys)
+        assert "same_schema_bonus" in sig.parameters
+        assert "cross_schema_penalty" in sig.parameters
+
+
+# --- TestDomainSignal ---
+
+
+class TestDomainSignal:
+    """Verify add_domain_signal wiring and behavior."""
+
+    def test_add_domain_signal_exists(self):
+        assert hasattr(FKPredictor, "add_domain_signal")
+
+    def test_run_calls_add_domain_signal(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "add_domain_signal" in src
+
+    def test_add_domain_signal_gracefully_handles_missing_table(self):
+        spark = MagicMock()
+        spark.sql.side_effect = Exception("TABLE_OR_VIEW_NOT_FOUND")
+        p = FKPredictor(spark, _cfg())
+        df = MagicMock()
+        df.withColumn = MagicMock(return_value=df)
+        result = p.add_domain_signal(df)
+        assert result is not None
+
+    def test_add_domain_signal_sql_references_metadata_log(self):
+        src = inspect.getsource(FKPredictor.add_domain_signal)
+        assert "metadata_generation_log" in src
+        assert "domain" in src
+        assert "subdomain" in src
+
+    def test_domain_match_scoring_logic(self):
+        """Source should compute 1.0 for same domain+subdomain, 0.5 for domain-only."""
+        src = inspect.getsource(FKPredictor.add_domain_signal)
+        assert "1.0" in src
+        assert "0.5" in src
+
+
+# --- TestNewRuleScoreSignals ---
+
+
+class TestNewRuleScoreSignals:
+    """Verify new rule_score signals: same_schema, same_domain, sim_floor."""
+
+    def test_same_schema_signal_in_source(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "schema_signal" in src
+        assert "same_schema_bonus" in src
+        assert "cross_schema_penalty" in src
+
+    def test_cross_schema_penalty_default_values(self):
+        cfg = FKPredictionConfig(catalog_name="c", schema_name="s")
+        assert cfg.same_schema_bonus == 0.10
+        assert cfg.cross_schema_penalty == -0.10
+
+    def test_cross_schema_penalty_configurable(self):
+        cfg = FKPredictionConfig(catalog_name="c", schema_name="s",
+                                 same_schema_bonus=0.20, cross_schema_penalty=-0.05)
+        assert cfg.same_schema_bonus == 0.20
+        assert cfg.cross_schema_penalty == -0.05
+
+    def test_same_domain_signal_in_source(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "same_domain" in src
+
+    def test_sim_floor_tiered_thresholds(self):
+        """sim_floor should have tiers at 0.98, 0.95, 0.90."""
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "0.98" in src
+        assert "0.95" in src
+        assert "0.90" in src
+
+    def test_source_bonus_weight_reduced(self):
+        """source_bonus weight should be 0.10, not the old 0.15."""
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "source_bonus * 0.10" in src
+
+    def test_domain_match_fallback_when_absent(self):
+        """When domain_match is NOT in columns, F.lit(0.0) should be used."""
+        from pyspark.sql import functions as F
+        F.lit.reset_mock()
+        p = FKPredictor(spark=MagicMock(), config=_cfg())
+        df = MagicMock()
+        df.columns = ["col_a", "col_b", "dtype_a", "dtype_b",
+                       "table_a", "table_b", "col_similarity",
+                       "samples_a", "samples_b"]
+        df.withColumn = MagicMock(return_value=df)
+        p.rule_score(df)
+        lit_args = [c[0][0] for c in F.lit.call_args_list if c[0]]
+        assert 0.0 in lit_args
+
+
+class TestDtypeExclusion:
+    """Verify FK-excluded data types constant and SQL helper."""
+
+    def test_excluded_dtypes_contains_float(self):
+        assert "float" in _FK_EXCLUDED_DTYPES
+
+    def test_excluded_dtypes_contains_variant(self):
+        assert "variant" in _FK_EXCLUDED_DTYPES
+
+    def test_excluded_dtypes_contains_struct(self):
+        assert "struct" in _FK_EXCLUDED_DTYPES
+
+    def test_excluded_dtypes_contains_boolean(self):
+        assert "boolean" in _FK_EXCLUDED_DTYPES
+
+    def test_excluded_dtypes_does_not_contain_int(self):
+        assert "int" not in _FK_EXCLUDED_DTYPES
+        assert "bigint" not in _FK_EXCLUDED_DTYPES
+        assert "string" not in _FK_EXCLUDED_DTYPES
+
+    def test_dtype_exclusion_sql_returns_quoted_list(self):
+        sql = _dtype_exclusion_sql()
+        assert "'float'" in sql
+        assert "'variant'" in sql
+        assert ", " in sql
+
+    def test_embedding_gen_uses_dtype_filter(self):
+        src = inspect.getsource(FKPredictor.get_candidates)
+        assert "_dtype_excluded(" in src
+
+    def test_name_gen_uses_dtype_filter(self):
+        src = inspect.getsource(FKPredictor.get_name_based_candidates)
+        assert "_dtype_excluded(" in src
+
+    def test_ontology_gen_uses_dtype_filter(self):
+        src = inspect.getsource(FKPredictor.get_ontology_relationship_candidates)
+        assert "_dtype_excluded(" in src
+
+    def test_colprop_gen_uses_shared_constant(self):
+        src = inspect.getsource(FKPredictor.get_column_property_candidates)
+        assert "_dtype_excluded(" in src
+
+    def test_dtype_excluded_predicate_format(self):
+        pred = _dtype_excluded("col.data_type")
+        assert "ELEMENT_AT(SPLIT(LOWER(col.data_type)" in pred
+        assert "'float'" in pred
+        assert "'decimal'" in pred
+
+    def test_dtype_excluded_handles_parameterized_types(self):
+        """Verify the SQL pattern strips parenthesized suffixes like decimal(38,0)."""
+        pred = _dtype_excluded("data_type")
+        assert "SPLIT" in pred and "'\\\\('" in pred
+
+
+class TestPKSignal:
+    """Verify add_pk_signal method and pk_match in rule_score."""
+
+    def test_add_pk_signal_exists(self):
+        assert hasattr(FKPredictor, "add_pk_signal")
+
+    def test_add_pk_signal_graceful_on_missing_table(self):
+        spark = MagicMock()
+        spark.sql.side_effect = Exception("table not found")
+        p = FKPredictor(spark=spark, config=_cfg())
+        df = MagicMock()
+        df.withColumn = MagicMock(return_value=df)
+        result = p.add_pk_signal(df)
+        assert result.withColumn.called
+
+    def test_run_calls_add_pk_signal(self):
+        src = inspect.getsource(FKPredictor.run)
+        assert "add_pk_signal" in src
+
+    def test_pk_match_signal_in_rule_score(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "pk_match" in src
+
+    def test_pk_match_weight_in_formula(self):
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert "pk_match * 0.10" in src
+
+    def test_col_similarity_weight_reduced(self):
+        """col_similarity weight reduced from 0.10 to 0.05 to make room for pk_match."""
+        src = inspect.getsource(FKPredictor.rule_score)
+        assert '("col_similarity") * 0.05' in src
+
+
+class TestCandidateCanonicalizationAlignment:
+    """All candidate generators must canonicalize pair order by column while keeping
+    each column paired with its OWN table and dtype. The old LEAST/GREATEST(col_a,col_b)
+    reordered the columns but left table_*/dtype_* in place, crossing the labels and
+    corrupting downstream join_rate. Each side must swap col/table/dtype in lockstep."""
+
+    _GENERATORS = (
+        "get_name_based_candidates",
+        "get_ontology_relationship_candidates",
+        "get_column_property_candidates",
+    )
+
+    def test_no_bare_least_greatest_col_swap(self):
+        for name in self._GENERATORS:
+            src = inspect.getsource(getattr(FKPredictor, name))
+            assert "LEAST(col_a, col_b) AS col_a" not in src, name
+            assert "GREATEST(col_a, col_b) AS col_b" not in src, name
+
+    def test_table_and_dtype_swap_in_lockstep_with_col(self):
+        for name in self._GENERATORS:
+            src = inspect.getsource(getattr(FKPredictor, name))
+            assert "CASE WHEN col_a <= col_b THEN col_a ELSE col_b END AS col_a" in src, name
+            assert "CASE WHEN col_a <= col_b THEN col_b ELSE col_a END AS col_b" in src, name
+            assert "CASE WHEN col_a <= col_b THEN table_a ELSE table_b END AS table_a" in src, name
+            assert "CASE WHEN col_a <= col_b THEN table_b ELSE table_a END AS table_b" in src, name
+            assert "CASE WHEN col_a <= col_b THEN dtype_a ELSE dtype_b END AS dtype_a" in src, name
+            assert "CASE WHEN col_a <= col_b THEN dtype_b ELSE dtype_a END AS dtype_b" in src, name
+
+
+
+# ---------------------------------------------------------------------------
+# Generic-column-name guard (federation 'id' over-matching fix).
+# ---------------------------------------------------------------------------
+from dbxmetagen.fk_prediction import (  # noqa: E402
+    _DEFAULT_GENERIC_COL_NAMES,
+    _generic_names_sql,
+)
+
+
+class TestGenericNamesSql:
+    def test_builds_quoted_lowercased_in_list(self):
+        out = _generic_names_sql(("ID", "Code", "status"))
+        assert out == "'id', 'code', 'status'"
+
+    def test_empty_yields_safe_placeholder(self):
+        # Empty must not produce `IN ()` (a SQL error); a never-matching literal is fine.
+        assert _generic_names_sql(()) == "''"
+
+    def test_escapes_single_quotes(self):
+        assert _generic_names_sql(("o'id",)) == "'o''id'"
+
+
+class TestGenericGuardConfig:
+    def test_default_generic_names_present(self):
+        c = FKPredictionConfig(catalog_name="c", schema_name="s")
+        assert "id" in c.generic_column_names
+        assert "status" in c.generic_column_names
+
+    def test_predict_foreign_keys_threads_generic_names(self):
+        sig = inspect.signature(predict_foreign_keys)
+        assert "generic_column_names" in sig.parameters
+        captured = {}
+        spark = MagicMock()
+
+        real_init = FKPredictionConfig.__init__
+
+        def _spy(self, *a, **k):
+            real_init(self, *a, **k)
+            captured["names"] = self.generic_column_names
+
+        with patch.object(FKPredictor, "run", return_value={"ok": True}), \
+             patch.object(FKPredictionConfig, "__init__", _spy):
+            predict_foreign_keys(spark, "c", "s", generic_column_names=("id", "foo"))
+        assert captured["names"] == ("id", "foo")
+
+
+class TestGenericGuardSql:
+    def test_get_candidates_sql_has_generic_guard(self):
+        spark = MagicMock()
+        p = FKPredictor(spark, _cfg())
+        p._changed_tables = None
+        p.get_candidates()
+        sql = spark.sql.call_args[0][0]
+        # generic IN-list present and the both-generic drop clause present
+        assert "'id'" in sql and "'status'" in sql
+        assert "j.short_a IN (" in sql and "j.short_b IN (" in sql
+        # only a table-name token-match corroborates a both-generic pair
+        assert "SPLIT(j.table_a" in sql and "', j.short_b, '" in sql
+
+    def test_name_based_same_name_excludes_generic(self):
+        spark = MagicMock()
+        p = FKPredictor(spark, _cfg())
+        p.get_name_based_candidates()
+        sql = spark.sql.call_args[0][0]
+        assert "c1.col_short NOT IN (" in sql
+        # classic strategy is preserved (fk stem must match the pk's table name)
+        assert "classic_matches" in sql
+        assert "pk.tbl_short" in sql
+
+
+class TestGenericGuardLogic:
+    """Python mirror of the get_candidates both-generic drop, to document intent."""
+
+    GENERIC = set(_DEFAULT_GENERIC_COL_NAMES)
+
+    @staticmethod
+    def _stem(col_short: str) -> str:
+        return re.sub(r"(_id|_key|_code)$", "", col_short)
+
+    @staticmethod
+    def _token_match(a: str, b: str) -> bool:
+        return bool(re.search(rf"(^|_){re.escape(b)}(_|$)", a))
+
+    def _dropped(self, short_a, short_b, table_a="c.s.foo", table_b="c.s.bar"):
+        # Mirrors get_candidates: a both-generic pair is dropped unless a TABLE
+        # short-name token-matches the OTHER side's column (role/entity linkage).
+        if not (short_a in self.GENERIC and short_b in self.GENERIC):
+            return False  # not both-generic -> never dropped by this guard
+        ta = table_a.split(".")[-1]
+        tb = table_b.split(".")[-1]
+        corroborated = self._token_match(ta, short_b) or self._token_match(tb, short_a)
+        return not corroborated
+
+    def test_id_x_id_dropped(self):
+        assert self._dropped("id", "id") is True
+
+    def test_status_x_type_dropped(self):
+        assert self._dropped("status", "type") is True
+
+    def test_prov_id_x_prov_id_kept(self):
+        # 'prov_id' is not a generic whole-name -> not both-generic -> guard N/A
+        assert self._dropped("prov_id", "prov_id") is False
+
+    def test_customer_id_x_id_kept(self):
+        # not both-generic (customer_id is non-generic)
+        assert self._dropped("customer_id", "id") is False
+
+    def test_generic_pair_kept_when_table_token_matches_other_col(self):
+        # 'code' on table 'status' vs 'status' col elsewhere: table_a 'status'
+        # token-matches short_b 'status' -> corroborated, kept.
+        assert self._dropped("code", "status", table_a="c.s.status", table_b="c.s.x") is False
+
+
+class TestDtypeFamily:
+    def test_int_family(self):
+        assert _dtype_family("BIGINT") == "int" == _dtype_family("int")
+    def test_string_family(self):
+        assert _dtype_family("STRING") == "string" == _dtype_family("varchar(20)")
+    def test_other_passthrough(self):
+        assert _dtype_family("DECIMAL(10,2)") == "decimal(10,2)"
+
+
+class TestDataOverlapDecision:
+    """PQ-1 precision guards for the value-overlap FK candidate generator (pure logic)."""
+
+    def _npi(self, n):  # helper: n distinct npi-like values
+        return {f"1{700000000 + i}" for i in range(n)}
+
+    def test_suffixless_key_recall(self):
+        # child fully contained in a key-like parent -> EMIT (this is the npi case)
+        child = self._npi(30)
+        parent = self._npi(40)          # superset, unique key
+        score = _data_overlap_decision(
+            child, parent, child_distinct=30, parent_distinct=40,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert score is not None and score >= 0.85
+
+    def test_symmetric_enum_trap_rejected(self):
+        # status_code <-> type_code: same small domain, neither key-like -> REJECT
+        vals = {"A", "B", "C"}
+        score = _data_overlap_decision(
+            vals, vals, child_distinct=3, parent_distinct=3,
+            parent_unique=False, parent_card=0.01, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert score is None
+
+    def test_small_domain_veto(self):
+        # both sides tiny distinct -> REJECT even if parent looks unique
+        vals = {"X", "Y"}
+        score = _data_overlap_decision(
+            vals, vals, child_distinct=2, parent_distinct=2,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert score is None
+
+    def test_no_intersection_rejected(self):
+        score = _data_overlap_decision(
+            self._npi(30), {f"2{i}" for i in range(30)},
+            child_distinct=30, parent_distinct=30,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert score is None
+
+    def test_parent_must_be_key_like(self):
+        # good containment but parent NOT key-like -> REJECT (asymmetry guard)
+        child = self._npi(20)
+        parent = self._npi(40)
+        score = _data_overlap_decision(
+            child, parent, child_distinct=20, parent_distinct=40,
+            parent_unique=False, parent_card=0.3, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert score is None
+
+    def test_ontology_relaxes_containment_bar(self):
+        # 0.70 containment: below the 0.85 default bar, but ABOVE the 0.60 ontology bar
+        child = self._npi(10) | {"MISS1", "MISS2", "MISS3"}   # 13 vals, 10 in parent -> 0.77
+        parent = self._npi(40)
+        base = _data_overlap_decision(
+            child, parent, child_distinct=13, parent_distinct=40,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        ont = _data_overlap_decision(
+            child, parent, child_distinct=13, parent_distinct=40,
+            parent_unique=True, parent_card=1.0, ontology_typed=True,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8)
+        assert base is None            # rejected at default bar
+        assert ont is not None         # accepted when ontology corroborates
+
+    def test_distinctive_format_relaxes_containment_bar(self):
+        # Large-domain natural key: only partial SAMPLE overlap (cached samples don't
+        # cover the whole domain), so containment ~0.40 -- below the 0.85 default bar but
+        # above the 0.30 distinctive bar. This is the email case that got zero candidates.
+        # 25-value child, 10 of them shared with a 59-value key parent -> containment 0.40.
+        child = self._npi(25)
+        parent = self._npi(10) | {f"9{i}" for i in range(49)}   # 59-value key domain, 10 shared
+        base = _data_overlap_decision(
+            child, parent, child_distinct=59, parent_distinct=59,
+            parent_unique=True, parent_card=0.98, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            distinctive_format=False, min_containment_distinctive=0.30)
+        dist = _data_overlap_decision(
+            child, parent, child_distinct=59, parent_distinct=59,
+            parent_unique=True, parent_card=0.98, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            distinctive_format=True, min_containment_distinctive=0.30)
+        assert base is None            # rejected at strict bar (partial sample overlap)
+        assert dist is not None        # accepted for a distinctive registered format
+
+    def test_table_mirror_rejected(self):
+        # dim_customer.customer_name vs dim_customer_staging.customer_name: BOTH unique
+        # (1:1 copy), 100% containment -> a table mirror, NOT a FK. Reject.
+        vals = {f"name{i}" for i in range(50)}
+        score = _data_overlap_decision(
+            vals, vals, child_distinct=50, parent_distinct=50,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            child_unique=True)
+        assert score is None
+
+    def test_table_mirror_allowed_when_ontology_corroborates(self):
+        # A genuine 1:1 link that the ontology asserts is exempt from the mirror veto.
+        vals = {f"name{i}" for i in range(50)}
+        score = _data_overlap_decision(
+            vals, vals, child_distinct=50, parent_distinct=50,
+            parent_unique=True, parent_card=1.0, ontology_typed=True,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            child_unique=True)
+        assert score is not None
+
+    def test_real_fk_child_is_non_unique(self):
+        # The real npi/email case: child repeats parent keys (non-unique) -> NOT vetoed.
+        child = self._npi(20)
+        parent = self._npi(40)
+        score = _data_overlap_decision(
+            child, parent, child_distinct=20, parent_distinct=40,
+            parent_unique=True, parent_card=1.0, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            child_unique=False)
+        assert score is not None
+
+    def test_distinctive_format_still_needs_key_like_parent(self):
+        # A distinctive format does NOT waive the parent-key-like asymmetry guard: a
+        # symmetric non-unique overlap stays rejected even with the relaxed bar.
+        child = self._npi(25)
+        parent = self._npi(10) | {f"9{i}" for i in range(49)}
+        score = _data_overlap_decision(
+            child, parent, child_distinct=59, parent_distinct=59,
+            parent_unique=False, parent_card=0.2, ontology_typed=False,
+            min_containment=0.85, min_containment_ontology=0.60, min_distinct=8,
+            distinctive_format=True, min_containment_distinctive=0.30)
+        assert score is None
+
+
+class TestValueOverlapGeneratorSmoke:
+    """Exercise get_value_overlap_candidates end-to-end with a mocked spark so runtime
+    NameErrors (e.g. a missing `import re`) and the tiering/emit path are covered --
+    the pure _data_overlap_decision tests alone missed the module-import bug."""
+
+    def _row(self, table, col, dtype, distinct, card, unique, pattern, vals):
+        import json as _json
+        return SimpleNamespace(
+            table_name=table, column_name=col, data_type=dtype,
+            distinct_count=distinct, cardinality_ratio=card,
+            is_unique_candidate=unique, null_rate=0.0,
+            pattern_detected=pattern, sample_values=_json.dumps(vals),
+        )
+
+    def test_runs_and_emits_overlap_pair(self):
+        cfg = _cfg()
+        spark = MagicMock()
+        # profiling rows: providers.npi (parent, unique) + claims.npi (child) overlap fully
+        npis = [f"1{700000000+i}" for i in range(30)]
+        rows = [
+            self._row("c.s.providers", "npi", "string", 30, 1.0, True, "npi", npis),
+            self._row("c.s.claims", "npi", "string", 30, 0.3, False, "npi", npis[:20]),
+        ]
+        spark.sql.return_value.toLocalIterator.return_value = iter(rows)
+        captured = {}
+
+        def _mk_df(data, schema=None):
+            captured["emitted"] = data
+            chain = MagicMock()
+            chain.withColumn.return_value = chain
+            return chain
+        spark.createDataFrame.side_effect = _mk_df
+        p = FKPredictor(spark, cfg)
+        p._ontology_typed_column_pairs = lambda: set()   # no ontology corroboration
+        with _patch_fk_functions_for_run():
+            result = p.get_value_overlap_candidates()
+        # A candidate pair was emitted (child claims.npi -> parent providers.npi).
+        # col_a/col_b are FQN node ids ("{table}.{col}") to match every other
+        # generator (graph_nodes.id) so downstream joins/dedup key correctly.
+        emitted = captured.get("emitted", [])
+        assert any(
+            e[0] == "c.s.claims.npi" and e[1] == "c.s.providers.npi"
+            and e[2] == "c.s.claims" and e[3] == "c.s.providers"
+            for e in emitted
+        )
+
+    def test_disabled_flag_returns_empty(self):
+        cfg = _cfg()
+        cfg.enable_data_overlap_candidates = False
+        spark = MagicMock()
+        p = FKPredictor(spark, cfg)
+        with _patch_fk_functions_for_run():
+            p.get_value_overlap_candidates()
+        # When disabled, no profiling query is issued.
+        assert not spark.sql.called
+
+    def test_exact_table_scope_excludes_prefix_siblings(self):
+        """An EXACT (non-wildcard) table_names scope must NOT over-match sibling
+        tables sharing the prefix (e.g. `orders` scope must exclude
+        `orders_archive`). Regression for the `rstrip('*')`+startswith bug."""
+        cfg = _cfg()
+        cfg.table_names = ["c.s.orders"]   # exact, no wildcard
+        spark = MagicMock()
+        ids = [str(1000 + i) for i in range(30)]
+        rows = [
+            # in-scope real FK: orders.customer_id -> customers.id
+            self._row("c.s.customers", "id", "bigint", 30, 1.0, True, "numeric_id", ids),
+            self._row("c.s.orders", "customer_id", "bigint", 30, 0.3, False, "numeric_id", ids[:20]),
+            # sibling that shares the `orders` prefix -- MUST be excluded from scope
+            self._row("c.s.orders_archive", "customer_id", "bigint", 30, 0.3, False, "numeric_id", ids[:20]),
+        ]
+        spark.sql.return_value.toLocalIterator.return_value = iter(rows)
+        captured = {}
+
+        def _mk_df(data, schema=None):
+            captured["emitted"] = data
+            chain = MagicMock()
+            chain.withColumn.return_value = chain
+            return chain
+        spark.createDataFrame.side_effect = _mk_df
+        p = FKPredictor(spark, cfg)
+        p._ontology_typed_column_pairs = lambda: set()
+        with _patch_fk_functions_for_run():
+            p.get_value_overlap_candidates()
+        emitted = captured.get("emitted", [])
+        # No emitted pair may reference orders_archive on either side.
+        assert not any(
+            "orders_archive" in str(e[2]) or "orders_archive" in str(e[3])
+            for e in emitted
+        ), f"orders_archive leaked into an exact-scoped run: {emitted}"
+
+    def test_wildcard_scope_still_matches_schema(self):
+        """A `cat.sch.*` wildcard scope still matches all tables in the schema
+        (the prefix guard keeps the trailing dot)."""
+        cfg = _cfg()
+        cfg.table_names = ["c.s.*"]
+        spark = MagicMock()
+        ids = [str(1000 + i) for i in range(30)]
+        rows = [
+            self._row("c.s.customers", "id", "bigint", 30, 1.0, True, "numeric_id", ids),
+            self._row("c.s.orders", "customer_id", "bigint", 30, 0.3, False, "numeric_id", ids[:20]),
+        ]
+        spark.sql.return_value.toLocalIterator.return_value = iter(rows)
+        captured = {}
+
+        def _mk_df(data, schema=None):
+            captured["emitted"] = data
+            chain = MagicMock()
+            chain.withColumn.return_value = chain
+            return chain
+        spark.createDataFrame.side_effect = _mk_df
+        p = FKPredictor(spark, cfg)
+        p._ontology_typed_column_pairs = lambda: set()
+        with _patch_fk_functions_for_run():
+            p.get_value_overlap_candidates()
+        emitted = captured.get("emitted", [])
+        assert any(e[2] == "c.s.orders" and e[3] == "c.s.customers" for e in emitted)

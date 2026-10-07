@@ -1,0 +1,47 @@
+resources:
+  jobs:
+    build_knowledge_graph_job:
+      name: "${var.app_name}${var.app_name_suffix}_build_knowledge_graph"
+      budget_policy_id: ${var.budget_policy_id}
+
+      permissions:
+        - service_principal_name: ${resources.apps.dbxmetagen_app.service_principal_client_id}
+          level: CAN_MANAGE_RUN
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      parameters:
+        - name: catalog_name
+          default: ${var.catalog_name}
+        - name: schema_name
+          default: ${var.schema_name}
+        - name: table_names
+          default: ""
+        - name: sweep_stale_edges
+          default: "false"
+        - name: incremental
+          default: "true"
+
+      tasks:
+        - task_key: build_knowledge_graph
+          max_retries: 1
+          min_retry_interval_millis: 600000
+          timeout_seconds: 14400
+          environment_key: default
+          notebook_task:
+            notebook_path: ../../notebooks/build_knowledge_graph.py
+            base_parameters:
+              catalog_name: "{{job.parameters.catalog_name}}"
+              schema_name: "{{job.parameters.schema_name}}"
+              table_names: "{{job.parameters.table_names}}"
+              sweep_stale_edges: "{{job.parameters.sweep_stale_edges}}"
+              incremental: "{{job.parameters.incremental}}"
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../../dist/*.whl

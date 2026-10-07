@@ -1,0 +1,972 @@
+# Integration Tests Job Definition
+#
+# Kept in resources/tests/ (outside the resources/jobs/ glob) so it is
+# NOT included in normal app/job deploys. The test runner script generates
+# a minimal bundle that only includes resources/tests/*.yml:
+#   ./scripts/run_integration_tests.sh
+#
+# See notebooks/integration_tests/README.md for full documentation.
+#
+# DAG structure -- tests are grouped into parallel waves:
+#
+#   Wave A (fast, no LLM):  test_01, test_17, test_18
+#   Wave B (core metadata):  test_02..test_09, test_20 across 3 clusters in parallel
+#   Wave C (concurrent):     test_10 setup -> parallel tasks -> validate
+#   Wave D (ETL pipeline):   test_11..test_16 on ML cluster
+#   Wave E (E2E compat):     e2e_serverless, e2e_ml, e2e_standard (no deps)
+#
+# Only test_01 (widget parsing) gates Waves B/C/D -- if basic config
+# parsing fails, nothing else will work.
+
+resources:
+  jobs:
+    integration_tests:
+      name: "dbxmetagen_integration_tests_${bundle.target}"
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      parameters:
+        - name: test_catalog
+          default: "dev_integration_tests"
+        - name: test_schema
+          default: "dbxmetagen_tests"
+        - name: run_id
+          default: "{{job.run_id}}"
+
+      tasks:
+        # ----------------------------------------------------------------
+        # Wave A: Fast config / parsing tests (no LLM, <1 min)
+        # ----------------------------------------------------------------
+
+        - task_key: test_01_widget_parsing
+          max_retries: 1
+          job_cluster_key: fast_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_01_widget_parsing.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_17_federation_mode
+          max_retries: 1
+          job_cluster_key: fast_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_17_federation_mode.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_18_comment_overrides
+          max_retries: 1
+          job_cluster_key: fast_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_18_comment_overrides.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # VS endpoint lifecycle -- standalone, no deps, no LLM.
+        # Run individually: databricks bundle run integration_tests -t dev --task test_vs_endpoint_lifecycle
+        - task_key: test_vs_endpoint_lifecycle
+          max_retries: 0
+          job_cluster_key: fast_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_vs_endpoint_lifecycle.py
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # ----------------------------------------------------------------
+        # Wave B: Core metadata generation tests (LLM calls, parallel clusters)
+        # All self-contained -- each creates/drops its own test table.
+        # Split across 3 clusters for ~3x parallelism.
+        # ----------------------------------------------------------------
+
+        # --- core_cluster_a: test_02, test_03, test_09 ---
+
+        - task_key: test_02_apply_ddl_false
+          max_retries: 1
+          depends_on:
+            - task_key: test_01_widget_parsing
+          job_cluster_key: core_cluster_a
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_02_apply_ddl_false.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_03_apply_ddl_true
+          max_retries: 1
+          depends_on:
+            - task_key: test_02_apply_ddl_false
+          job_cluster_key: core_cluster_a
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_03_apply_ddl_true.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_09_pi_classification_none
+          max_retries: 1
+          depends_on:
+            - task_key: test_03_apply_ddl_true
+          job_cluster_key: core_cluster_a
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_09_pi_classification_none.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_20_summarizer_bleedthrough
+          max_retries: 1
+          depends_on:
+            - task_key: test_09_pi_classification_none
+          job_cluster_key: core_cluster_a
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_20_summarizer_bleedthrough.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # --- core_cluster_b: test_04, test_05, test_08 ---
+
+        - task_key: test_04_modes
+          max_retries: 1
+          depends_on:
+            - task_key: test_01_widget_parsing
+          job_cluster_key: core_cluster_b
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_04_modes.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_05_temp_table_cleanup
+          max_retries: 1
+          depends_on:
+            - task_key: test_04_modes
+          job_cluster_key: core_cluster_b
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_05_temp_table_cleanup.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_08_reviewed_ddl
+          max_retries: 1
+          depends_on:
+            - task_key: test_05_temp_table_cleanup
+          job_cluster_key: core_cluster_b
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_08_reviewed_ddl.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # --- integration_test_cluster: test_06, test_07 ---
+
+        - task_key: test_06_control_table
+          max_retries: 1
+          depends_on:
+            - task_key: test_01_widget_parsing
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_06_control_table.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_07_permissions
+          max_retries: 1
+          depends_on:
+            - task_key: test_06_control_table
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_07_permissions.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # ----------------------------------------------------------------
+        # Wave C: Concurrent task claiming test
+        # ----------------------------------------------------------------
+
+        - task_key: test_10_concurrent_setup
+          max_retries: 1
+          depends_on:
+            - task_key: test_01_widget_parsing
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_10_concurrent_setup.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: concurrent_task_1
+          max_retries: 1
+          depends_on:
+            - task_key: test_10_concurrent_setup
+          job_cluster_key: concurrent_cluster_1
+          notebook_task:
+            notebook_path: ../../notebooks/generate_metadata.py
+            base_parameters:
+              mode: "comment"
+              table_names: "{{job.parameters.test_catalog}}.{{job.parameters.test_schema}}.concurrent_test_1,{{job.parameters.test_catalog}}.{{job.parameters.test_schema}}.concurrent_test_2"
+              catalog_name: "{{job.parameters.test_catalog}}"
+              schema_name: "{{job.parameters.test_schema}}"
+              cleanup_control_table: "false"
+              run_id: "{{job.parameters.run_id}}"
+              grant_permissions_after_creation: "false"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: concurrent_task_2
+          max_retries: 1
+          depends_on:
+            - task_key: test_10_concurrent_setup
+          job_cluster_key: concurrent_cluster_2
+          notebook_task:
+            notebook_path: ../../notebooks/generate_metadata.py
+            base_parameters:
+              mode: "comment"
+              table_names: "{{job.parameters.test_catalog}}.{{job.parameters.test_schema}}.concurrent_test_2,{{job.parameters.test_catalog}}.{{job.parameters.test_schema}}.concurrent_test_3"
+              catalog_name: "{{job.parameters.test_catalog}}"
+              schema_name: "{{job.parameters.test_schema}}"
+              cleanup_control_table: "false"
+              run_id: "{{job.parameters.run_id}}"
+              grant_permissions_after_creation: "false"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_10_concurrent_validate
+          max_retries: 1
+          depends_on:
+            - task_key: concurrent_task_1
+            - task_key: concurrent_task_2
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_10_concurrent_validate.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+              run_id: "{{job.parameters.run_id}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # ----------------------------------------------------------------
+        # Wave D: ETL pipeline tests (ML cluster, isolated schemas)
+        # test_11..test_15 are independent; test_12 -> test_16 is chained.
+        # All run on the same ML cluster (serialize), but the wave itself
+        # is parallel with Waves B and C.
+        # ----------------------------------------------------------------
+
+        - task_key: test_11_knowledge_base
+          max_retries: 1
+          depends_on:
+            - task_key: test_01_widget_parsing
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_11_knowledge_base.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_12_knowledge_graph
+          max_retries: 1
+          depends_on:
+            - task_key: test_11_knowledge_base
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_12_knowledge_graph.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+              skip_cleanup: "true"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_16_analytics_pipeline
+          max_retries: 1
+          depends_on:
+            - task_key: test_12_knowledge_graph
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_16_analytics_pipeline.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+              graph_test_schema: "{{tasks.test_12_knowledge_graph.values.graph_test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_13_profiling
+          max_retries: 1
+          depends_on:
+            - task_key: test_16_analytics_pipeline
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_13_profiling.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_14_ontology
+          max_retries: 1
+          depends_on:
+            - task_key: test_13_profiling
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_14_ontology.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # test_15_graph_validation skipped -- same_domain edge generation
+        # changed; assertions need rewrite. Tracked as ON-7.
+
+        - task_key: test_22_metric_view_deploy
+          max_retries: 1
+          depends_on:
+            - task_key: test_14_ontology
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_22_metric_view_deploy.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # ----------------------------------------------------------------
+        # Wave F: Analytics pipeline component tests
+        # ----------------------------------------------------------------
+
+        - task_key: test_23_fk_prediction
+          max_retries: 1
+          depends_on:
+            - task_key: test_14_ontology
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_23_fk_prediction.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_24_semantic_layer
+          max_retries: 1
+          depends_on:
+            - task_key: test_14_ontology
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_24_semantic_layer.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_25_vector_index_build
+          max_retries: 1
+          depends_on:
+            - task_key: test_14_ontology
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_25_vector_index_build.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_26_data_quality
+          max_retries: 1
+          depends_on:
+            - task_key: test_13_profiling
+          job_cluster_key: integration_test_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_26_data_quality.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_27_serverless_smoke
+          max_retries: 1
+          job_cluster_key: e2e_serverless_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_27_serverless_smoke.py
+            base_parameters:
+              catalog_name: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        # ----------------------------------------------------------------
+        # Wave E: E2E cluster compatibility tests (no deps, fully parallel)
+        # Each runs the full pipeline on a different Spark runtime.
+        # ----------------------------------------------------------------
+
+        - task_key: test_e2e_serverless
+          max_retries: 1
+          job_cluster_key: e2e_serverless_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_e2e_serverless.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_e2e_ml_cluster
+          max_retries: 1
+          job_cluster_key: e2e_ml_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_e2e_ml_cluster.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+        - task_key: test_e2e_standard_cluster
+          max_retries: 1
+          job_cluster_key: e2e_standard_cluster
+          notebook_task:
+            notebook_path: ../../notebooks/integration_tests/test_e2e_standard_cluster.py
+            base_parameters:
+              test_catalog: "{{job.parameters.test_catalog}}"
+              test_schema: "{{job.parameters.test_schema}}"
+          libraries:
+            - whl: ../../dist/*.whl
+            - pypi:
+                package: databricks-langchain==0.4.0
+            - pypi:
+                package: openai==1.56.1
+            - pypi:
+                package: openpyxl==3.1.5
+            - pypi:
+                package: deprecated==1.2.13
+            - pypi:
+                package: "nest-asyncio>=1.6.0,<2"
+
+      # ------------------------------------------------------------------
+      # Cluster definitions
+      # ------------------------------------------------------------------
+
+      job_clusters:
+        # Fast tests -- config/parsing only, no LLM
+        - job_cluster_key: fast_test_cluster
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        # Core metadata tests -- batch A (test_02, test_03, test_09, test_20)
+        - job_cluster_key: core_cluster_a
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        # Core metadata tests -- batch B (test_04, test_05, test_08)
+        - job_cluster_key: core_cluster_b
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        # Core metadata tests -- batch C (test_06, test_07) + concurrent setup/validate
+        - job_cluster_key: integration_test_cluster
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        # Concurrent task testing -- must be separate clusters for true parallelism
+        - job_cluster_key: concurrent_cluster_1
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        - job_cluster_key: concurrent_cluster_2
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        # E2E / ETL tests -- different runtime configurations
+        - job_cluster_key: e2e_serverless_cluster
+          new_cluster:
+            spark_version: 17.3.x-photon-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 1
+            data_security_mode: SINGLE_USER
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        - job_cluster_key: e2e_ml_cluster
+          new_cluster:
+            spark_version: 17.3.x-cpu-ml-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE
+
+        - job_cluster_key: e2e_standard_cluster
+          new_cluster:
+            spark_version: 17.3.x-scala2.13
+            node_type_id: ${var.node_type}
+            num_workers: 0
+            data_security_mode: USER_ISOLATION
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            # --- Uncomment for AWS ---
+            # aws_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK
+            # --- Uncomment for Azure ---
+            # azure_attributes:
+            #   first_on_demand: 1
+            #   availability: SPOT_WITH_FALLBACK_AZURE

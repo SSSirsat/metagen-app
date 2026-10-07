@@ -1,0 +1,64 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Generate Semantic Layer
+# MAGIC
+# MAGIC Reads pending business questions and generates metric view definitions
+# MAGIC using AI_QUERY and existing catalog metadata (knowledge bases, FK predictions, ontology).
+
+# COMMAND ----------
+
+# MAGIC # Uncomment below when running outside of a DAB-deployed job
+# MAGIC # %pip install /Workspace/Users/<your_username>/.bundle/dbxmetagen/dev/artifacts/.internal/dbxmetagen-*.whl
+# MAGIC # dbutils.library.restartPython()
+
+# COMMAND ----------
+
+dbutils.widgets.text("catalog_name", "", "Catalog Name")
+dbutils.widgets.text("schema_name", "", "Schema Name")
+dbutils.widgets.text("model_endpoint", "databricks-gpt-oss-120b", "Model Endpoint")
+dbutils.widgets.dropdown("materialize", "false", ["true", "false"], "Materialize Metric Views")
+dbutils.widgets.text("materialization_schedule", "every 6 hours", "Materialization Schedule")
+
+catalog_name = dbutils.widgets.get("catalog_name")
+schema_name = dbutils.widgets.get("schema_name")
+model_endpoint = dbutils.widgets.get("model_endpoint")
+materialize = dbutils.widgets.get("materialize").lower() == "true"
+materialization_schedule = dbutils.widgets.get("materialization_schedule")
+
+print(f"Catalog: {catalog_name}")
+print(f"Schema: {schema_name}")
+print(f"Model: {model_endpoint}")
+print(f"Materialize: {materialize} (schedule: {materialization_schedule})")
+
+# COMMAND ----------
+
+import sys
+sys.path.append("../src")  # For git-clone or DAB deployment; pip-installed package works without this
+
+from dbxmetagen.semantic_layer import SemanticLayerGenerator, SemanticLayerConfig
+
+config = SemanticLayerConfig(
+    catalog_name=catalog_name,
+    schema_name=schema_name,
+    model_endpoint=model_endpoint,
+    materialize_metric_views=materialize,
+    materialization_schedule=materialization_schedule,
+)
+gen = SemanticLayerGenerator(spark, config)
+gen.create_tables()
+
+# COMMAND ----------
+
+result = gen.generate_metric_views()
+print(f"Generation complete:")
+print(f"  Generated: {result['generated']}")
+print(f"  Validated: {result['validated']}")
+print(f"  Failed:    {result['failed']}")
+
+# COMMAND ----------
+
+display(spark.sql(f"""
+    SELECT definition_id, metric_view_name, source_table, status, validation_errors, created_at
+    FROM {catalog_name}.{schema_name}.metric_view_definitions
+    ORDER BY created_at DESC
+"""))

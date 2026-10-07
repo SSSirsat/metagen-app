@@ -1,0 +1,31 @@
+resources:
+  jobs:
+    dbxmetagen_metadata_job:
+      name: "dbxmetagen_metadata_job"
+
+      parameters:
+        - name: table_names
+          default: ""
+        - name: mode
+          default: "comment"
+        - name: catalog_name
+          default: ${var.catalog_name}
+        - name: schema_name
+          default: ${var.schema_name}
+
+      tasks:
+        - task_key: generate_metadata
+          environment_key: default
+          notebook_task:
+            notebook_path: ${var.dbxmetagen_notebooks}/generate_metadata
+            base_parameters:
+              mode: "{{job.parameters.mode}}"
+              table_names: "{{job.parameters.table_names}}"
+              catalog_name: "{{job.parameters.catalog_name}}"
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+            dependencies:
+              - ${var.dbxmetagen_wheel}

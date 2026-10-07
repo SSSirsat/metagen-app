@@ -1,0 +1,316 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Integration Test: Knowledge Graph ETL
+# MAGIC 
+# MAGIC Tests the knowledge graph ETL pipeline that builds
+# MAGIC node and edge Delta tables from the table_knowledge_base.
+# MAGIC
+# MAGIC This test validates:
+# MAGIC - Node table creation and population
+# MAGIC - Edge table creation and population  
+# MAGIC - Incremental merge behavior
+# MAGIC - Edge refresh on relationship changes
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Setup
+
+# COMMAND ----------
+
+import sys
+sys.path.append("../../src")  # For git-clone or DAB deployment; pip-installed package works without this
+
+from datetime import datetime
+from pyspark.sql import Row
+
+# Get test parameters
+dbutils.widgets.text("catalog_name", "dev_integration_tests", "Catalog Name")
+dbutils.widgets.text("test_schema", "dbxmetagen_tests", "Test Schema")
+dbutils.widgets.dropdown("skip_cleanup", "false", ["true", "false"], "Skip Cleanup (leave schema for test_16)")
+
+catalog_name = dbutils.widgets.get("catalog_name")
+test_schema = dbutils.widgets.get("test_schema")
+skip_cleanup = dbutils.widgets.get("skip_cleanup").strip().lower() == "true"
+
+test_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+graph_test_schema = f"graph_test_{test_timestamp}"
+
+print(f"Test catalog: {catalog_name}")
+print(f"Test schema: {graph_test_schema}")
+print(f"Skip cleanup: {skip_cleanup}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Create Test Schema and Mock Knowledge Base
+
+# COMMAND ----------
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{graph_test_schema}")
+print(f"[SETUP] Created test schema: {graph_test_schema}")
+
+# COMMAND ----------
+
+# Create mock table_knowledge_base with test data
+spark.sql(f"""
+CREATE OR REPLACE TABLE {catalog_name}.{graph_test_schema}.table_knowledge_base (
+    table_name STRING NOT NULL,
+    catalog STRING,
+    `schema` STRING,
+    table_short_name STRING,
+    comment STRING,
+    domain STRING,
+    subdomain STRING,
+    has_pii BOOLEAN,
+    has_phi BOOLEAN,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+)
+""")
+
+print("[SETUP] Created mock table_knowledge_base")
+
+# COMMAND ----------
+
+# Insert test data representing tables with various relationships
+test_kb_data = [
+    # Customer domain tables (same domain, different subdomains)
+    Row(
+        table_name=f"{catalog_name}.{graph_test_schema}.customers",
+        catalog=catalog_name, schema=graph_test_schema, table_short_name="customers",
+        comment="Customer master data", domain="Customer", subdomain="Master",
+        has_pii=True, has_phi=False,
+        created_at=datetime(2024, 1, 1), updated_at=datetime(2024, 1, 1)
+    ),
+    Row(
+        table_name=f"{catalog_name}.{graph_test_schema}.customer_addresses",
+        catalog=catalog_name, schema=graph_test_schema, table_short_name="customer_addresses",
+        comment="Customer addresses", domain="Customer", subdomain="Contact",
+        has_pii=True, has_phi=False,
+        created_at=datetime(2024, 1, 1), updated_at=datetime(2024, 1, 1)
+    ),
+    # Healthcare domain tables (PHI)
+    Row(
+        table_name=f"{catalog_name}.{graph_test_schema}.patients",
+        catalog=catalog_name, schema=graph_test_schema, table_short_name="patients",
+        comment="Patient records", domain="Healthcare", subdomain="Clinical",
+        has_pii=True, has_phi=True,
+        created_at=datetime(2024, 1, 1), updated_at=datetime(2024, 1, 1)
+    ),
+    Row(
+        table_name=f"{catalog_name}.{graph_test_schema}.diagnoses",
+        catalog=catalog_name, schema=graph_test_schema, table_short_name="diagnoses",
+        comment="Medical diagnoses", domain="Healthcare", subdomain="Clinical",
+        has_pii=True, has_phi=True,
+        created_at=datetime(2024, 1, 1), updated_at=datetime(2024, 1, 1)
+    ),
+    # Public reference table (no PII/PHI)
+    Row(
+        table_name=f"{catalog_name}.{graph_test_schema}.product_catalog",
+        catalog=catalog_name, schema=graph_test_schema, table_short_name="product_catalog",
+        comment="Product catalog", domain="Product", subdomain="Master",
+        has_pii=False, has_phi=False,
+        created_at=datetime(2024, 1, 1), updated_at=datetime(2024, 1, 1)
+    ),
+]
+
+test_kb_df = spark.createDataFrame(test_kb_data)
+test_kb_df.write.mode("append").saveAsTable(f"{catalog_name}.{graph_test_schema}.table_knowledge_base")
+
+print(f"[SETUP] Inserted {len(test_kb_data)} test records")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Run Knowledge Graph ETL
+
+# COMMAND ----------
+
+from dbxmetagen.knowledge_graph import (
+    KnowledgeGraphConfig,
+    KnowledgeGraphBuilder,
+    build_knowledge_graph
+)
+
+# Run the ETL
+result = build_knowledge_graph(
+    spark=spark,
+    catalog_name=catalog_name,
+    schema_name=graph_test_schema
+)
+
+print(f"[ETL] Staged nodes: {result['staged_nodes']}")
+print(f"[ETL] Staged edges: {result['staged_edges']}")
+print(f"[ETL] Total nodes: {result['total_nodes']}")
+print(f"[ETL] Total edges: {result['total_edges']}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Validate Node Table
+
+# COMMAND ----------
+
+# Test 1: Verify correct number of nodes
+node_count = spark.sql(f"""
+    SELECT COUNT(*) as cnt 
+    FROM {catalog_name}.{graph_test_schema}.graph_nodes
+""").collect()[0]["cnt"]
+
+assert node_count == 5, f"Expected 5 nodes, got {node_count}"
+print("[TEST 1] PASSED: Correct number of nodes")
+
+# COMMAND ----------
+
+# Test 2: Verify node properties
+nodes_df = spark.sql(f"""
+    SELECT id, table_name, domain, security_level, has_pii, has_phi
+    FROM {catalog_name}.{graph_test_schema}.graph_nodes
+    ORDER BY table_name
+""")
+
+nodes = {row["table_name"]: row for row in nodes_df.collect()}
+
+# Check customers node
+customers_node = nodes[f"{catalog_name}.{graph_test_schema}.customers"]
+assert customers_node["id"] == customers_node["table_name"], "id should equal table_name"
+assert customers_node["domain"] == "Customer", "Domain should be Customer"
+assert customers_node["security_level"] == "PII", "Security level should be PII"
+assert customers_node["has_pii"] == True, "has_pii should be True"
+assert customers_node["has_phi"] == False, "has_phi should be False"
+
+# Check patients node (PHI)
+patients_node = nodes[f"{catalog_name}.{graph_test_schema}.patients"]
+assert patients_node["security_level"] == "PHI", "Security level should be PHI for healthcare"
+assert patients_node["has_phi"] == True, "has_phi should be True"
+
+# Check product_catalog node (PUBLIC)
+products_node = nodes[f"{catalog_name}.{graph_test_schema}.product_catalog"]
+assert products_node["security_level"] == "PUBLIC", "Security level should be PUBLIC"
+assert products_node["has_pii"] == False, "has_pii should be False"
+
+print("[TEST 2] PASSED: Node properties are correct")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Validate Edge Table
+
+# COMMAND ----------
+
+# Test 3: Verify same_security_level edges
+# The builder only creates same_security_level edges (same_domain/subdomain/catalog/schema
+# were removed -- FK prediction computes those inline).
+edge_counts = spark.sql(f"""
+    SELECT relationship, COUNT(*) as cnt
+    FROM {catalog_name}.{graph_test_schema}.graph_edges
+    GROUP BY relationship
+""")
+
+edge_map = {row["relationship"]: row["cnt"] for row in edge_counts.collect()}
+
+# PII group: customers, customer_addresses -> C(2,2) = 1 edge
+# PHI group: patients, diagnoses -> C(2,2) = 1 edge
+# PUBLIC: product_catalog -> filtered out (only PII/PHI get edges)
+assert "same_security_level" in edge_map, "Should have same_security_level edges"
+assert edge_map["same_security_level"] == 2, f"Expected 2 same_security_level edges (1 PII + 1 PHI), got {edge_map['same_security_level']}"
+
+print(f"[TEST 3] PASSED: Edge relationship types exist")
+print(f"  Edge counts by type: {edge_map}")
+
+# COMMAND ----------
+
+# Test 4: Verify same_security_level edges connect PII tables correctly
+pii_edges = spark.sql(f"""
+    SELECT src, dst 
+    FROM {catalog_name}.{graph_test_schema}.graph_edges
+    WHERE relationship = 'same_security_level'
+    AND (src LIKE '%customers%' OR dst LIKE '%customers%')
+""").collect()
+
+assert len(pii_edges) == 1, f"Expected 1 PII edge connecting customers<->customer_addresses, got {len(pii_edges)}"
+edge = pii_edges[0]
+assert "customers" in edge["src"] or "customers" in edge["dst"], "Edge should involve customers table"
+assert "customer_addresses" in edge["src"] or "customer_addresses" in edge["dst"], "Edge should involve customer_addresses table"
+print("[TEST 4] PASSED: Security level edges connect correct tables")
+
+# COMMAND ----------
+
+# Test 5: Verify edge direction (src < dst to avoid duplicates)
+duplicate_edges = spark.sql(f"""
+    SELECT COUNT(*) as cnt
+    FROM {catalog_name}.{graph_test_schema}.graph_edges
+    WHERE src >= dst
+""").collect()[0]["cnt"]
+
+assert duplicate_edges == 0, f"Found {duplicate_edges} edges with src >= dst (duplicates/self-loops)"
+print("[TEST 5] PASSED: No duplicate or self-loop edges")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Test Edge Refresh on Relationship Change
+
+# COMMAND ----------
+
+# Test 6: Simulate security_level change and verify edges are refreshed
+# Change product_catalog from PUBLIC to PII (has_pii=True)
+spark.sql(f"""
+    UPDATE {catalog_name}.{graph_test_schema}.table_knowledge_base
+    SET has_pii = true, updated_at = current_timestamp()
+    WHERE table_name = '{catalog_name}.{graph_test_schema}.product_catalog'
+""")
+
+edges_before = edge_map["same_security_level"]
+
+# Re-run graph build
+result2 = build_knowledge_graph(
+    spark=spark,
+    catalog_name=catalog_name,
+    schema_name=graph_test_schema
+)
+
+edges_after = spark.sql(f"""
+    SELECT COUNT(*) as cnt
+    FROM {catalog_name}.{graph_test_schema}.graph_edges
+    WHERE relationship = 'same_security_level'
+""").collect()[0]["cnt"]
+
+# Before: PII(2) -> 1 edge, PHI(2) -> 1 edge = 2
+# After:  PII(3) -> 3 edges, PHI(2) -> 1 edge = 4
+assert edges_after > edges_before, \
+    f"Security edges should increase after making product_catalog PII (before: {edges_before}, after: {edges_after})"
+
+print(f"[TEST 6] PASSED: Edge refresh handled security_level change correctly")
+print(f"  same_security_level edges before: {edges_before}")
+print(f"  same_security_level edges after: {edges_after}")
+
+# COMMAND ----------
+
+# Test 7: Verify product_catalog is now connected to other PII tables
+product_pii_edges = spark.sql(f"""
+    SELECT COUNT(*) as cnt
+    FROM {catalog_name}.{graph_test_schema}.graph_edges
+    WHERE relationship = 'same_security_level'
+    AND (src LIKE '%product_catalog%' OR dst LIKE '%product_catalog%')
+""").collect()[0]["cnt"]
+
+assert product_pii_edges >= 1, "product_catalog should now be connected to other PII tables"
+print("[TEST 7] PASSED: product_catalog now connected to PII tables")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Cleanup
+
+# COMMAND ----------
+
+if skip_cleanup:
+    print(f"[CLEANUP] Skipping cleanup -- schema left for downstream tests")
+    dbutils.jobs.taskValues.set(key="graph_test_schema", value=graph_test_schema)
+else:
+    spark.sql(f"DROP SCHEMA IF EXISTS {catalog_name}.{graph_test_schema} CASCADE")
+    print(f"[CLEANUP] Dropped test schema: {graph_test_schema}")
+
+# COMMAND ----------
+
+import json
+print("=" * 60)
+print("ALL KNOWLEDGE GRAPH INTEGRATION TESTS PASSED")
+print("=" * 60)
+dbutils.notebook.exit(json.dumps({"passed": True, "error": None}))
+

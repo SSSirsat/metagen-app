@@ -1,0 +1,166 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Predict Foreign Keys
+# MAGIC
+# MAGIC Block-aware join-key discovery: embedding similarity with duplicate-table
+# MAGIC suppression, declared/query/name/ontology signals, budgeted AI_QUERY.
+
+# COMMAND ----------
+
+# MAGIC # Uncomment below when running outside of a DAB-deployed job
+# MAGIC # %pip install /Workspace/Users/<your_username>/.bundle/dbxmetagen/dev/artifacts/.internal/dbxmetagen-*.whl
+# MAGIC # dbutils.library.restartPython()
+
+# COMMAND ----------
+
+dbutils.widgets.text("catalog_name", "", "Catalog Name")
+dbutils.widgets.text("schema_name", "", "Schema Name")
+dbutils.widgets.text("column_similarity_threshold", "0.85", "Column Similarity Threshold")
+dbutils.widgets.text("table_similarity_threshold", "0.9", "Deprecated (ignored); kept for job compat")
+dbutils.widgets.text("duplicate_table_similarity_threshold", "0.97", "Suppress same-block near-duplicate tables")
+dbutils.widgets.text("cross_block_column_similarity_min", "0.92", "Min col similarity for cross-schema embedding pairs")
+dbutils.widgets.text("cross_block_strict", "true", "Cross-block stricter floor (true/false)")
+dbutils.widgets.text("ontology_cross_block", "false", "Allow ontology pairs across schemas (true/false)")
+dbutils.widgets.text("skip_ai_for_declared_fk", "false", "Skip AI_QUERY for declared FKs (true/false)")
+dbutils.widgets.text("skip_ai_query_min_observations", "0", "Min query-history hits to skip AI (0=off)")
+dbutils.widgets.text("confidence_threshold", "0.7", "Confidence Threshold")
+dbutils.widgets.text("sample_size", "5", "Sample Size")
+dbutils.widgets.text("apply_ddl", "false", "Apply DDL")
+dbutils.widgets.text("dry_run", "false", "Dry Run (count only, no AI calls)")
+dbutils.widgets.text("incremental", "true", "Incremental embedding path only (true/false)")
+dbutils.widgets.text("max_ai_candidates", "200", "Max rows sent to AI_QUERY")
+dbutils.widgets.text("rule_score_min_for_ai", "0.50", "Min rule score to qualify for AI judge")
+dbutils.widgets.text("max_candidates_per_table_pair", "5", "Max candidates per table pair (name/ontology)")
+dbutils.widgets.text("same_schema_bonus", "0.10", "Same-schema FK score bonus")
+dbutils.widgets.text("cross_schema_penalty", "-0.10", "Cross-schema FK score penalty")
+dbutils.widgets.text("system_column_exclude_patterns", "", "Regex patterns to exclude system columns from FK boosting (comma-separated, empty=defaults)")
+dbutils.widgets.text("generic_column_names", "", "Generic column names (e.g. id,code,status) that need corroboration to form an FK (comma-separated, empty=defaults)")
+dbutils.widgets.text("sweep_stale_edges", "false", "Sweep stale edges")
+# PQ-1: data-driven (value-overlap) FK candidates -- catch keys with no _id/_key/_code suffix.
+dbutils.widgets.text("enable_data_overlap_candidates", "true", "Enable value-overlap FK candidates")
+dbutils.widgets.text("fk_data_overlap_min_containment", "0.85", "Value-overlap min containment")
+dbutils.widgets.text("fk_data_overlap_min_containment_ontology", "0.60", "Value-overlap min containment (ontology-corroborated)")
+dbutils.widgets.text("fk_data_overlap_min_containment_distinctive", "0.30", "Value-overlap min containment (distinctive format: email/npi/ndc/cusip/uuid)")
+dbutils.widgets.text("fk_data_overlap_min_distinct", "8", "Value-overlap small-domain veto (min distinct)")
+dbutils.widgets.text("fk_data_overlap_weight", "0.25", "Value-overlap rule_score weight")
+dbutils.widgets.text("fk_data_overlap_max_candidates", "2000", "Value-overlap global candidate ceiling")
+dbutils.widgets.text("fk_mirror_uniqueness_threshold", "0.95", "Mirror veto: both card ratios >= this on low-trust pair -> 1:1 mirror, not FK")
+dbutils.widgets.text("table_names", "", "Table Names")
+dbutils.widgets.dropdown("federation_mode", "false", ["true", "false"], "Federation Mode")
+
+catalog_name = dbutils.widgets.get("catalog_name")
+schema_name = dbutils.widgets.get("schema_name")
+column_similarity_threshold = float(dbutils.widgets.get("column_similarity_threshold"))
+table_similarity_threshold = float(dbutils.widgets.get("table_similarity_threshold"))
+duplicate_table_similarity_threshold = float(dbutils.widgets.get("duplicate_table_similarity_threshold"))
+cross_block_column_similarity_min = float(dbutils.widgets.get("cross_block_column_similarity_min"))
+cross_block_strict = dbutils.widgets.get("cross_block_strict").lower() == "true"
+ontology_cross_block = dbutils.widgets.get("ontology_cross_block").lower() == "true"
+skip_ai_for_declared_fk = dbutils.widgets.get("skip_ai_for_declared_fk").lower() == "true"
+skip_ai_query_min_observations = int(dbutils.widgets.get("skip_ai_query_min_observations"))
+confidence_threshold = float(dbutils.widgets.get("confidence_threshold"))
+sample_size = int(dbutils.widgets.get("sample_size"))
+apply_ddl = dbutils.widgets.get("apply_ddl").lower() == "true"
+dry_run = dbutils.widgets.get("dry_run").lower() == "true"
+incremental = dbutils.widgets.get("incremental").lower() == "true"
+max_ai_candidates = int(dbutils.widgets.get("max_ai_candidates"))
+rule_score_min_for_ai = float(dbutils.widgets.get("rule_score_min_for_ai"))
+max_candidates_per_table_pair = int(dbutils.widgets.get("max_candidates_per_table_pair"))
+same_schema_bonus = float(dbutils.widgets.get("same_schema_bonus"))
+cross_schema_penalty = float(dbutils.widgets.get("cross_schema_penalty"))
+_sys_col_raw = dbutils.widgets.get("system_column_exclude_patterns").strip()
+system_column_patterns = tuple(p.strip() for p in _sys_col_raw.split(",") if p.strip()) if _sys_col_raw else None
+_generic_raw = dbutils.widgets.get("generic_column_names").strip()
+generic_column_names = tuple(p.strip().lower() for p in _generic_raw.split(",") if p.strip()) if _generic_raw else None
+sweep_stale = dbutils.widgets.get("sweep_stale_edges").strip().lower() in ("true", "1", "yes")
+enable_data_overlap_candidates = dbutils.widgets.get("enable_data_overlap_candidates").strip().lower() in ("true", "1", "yes")
+fk_data_overlap_min_containment = float(dbutils.widgets.get("fk_data_overlap_min_containment"))
+fk_data_overlap_min_containment_ontology = float(dbutils.widgets.get("fk_data_overlap_min_containment_ontology"))
+fk_data_overlap_min_containment_distinctive = float(dbutils.widgets.get("fk_data_overlap_min_containment_distinctive"))
+fk_data_overlap_min_distinct = int(dbutils.widgets.get("fk_data_overlap_min_distinct"))
+fk_data_overlap_weight = float(dbutils.widgets.get("fk_data_overlap_weight"))
+fk_data_overlap_max_candidates = int(dbutils.widgets.get("fk_data_overlap_max_candidates"))
+fk_mirror_uniqueness_threshold = float(dbutils.widgets.get("fk_mirror_uniqueness_threshold"))
+
+federation_mode = dbutils.widgets.get("federation_mode").lower() == "true"
+
+if not catalog_name or not schema_name:
+    raise ValueError("Both catalog_name and schema_name are required")
+
+print(f"Predicting foreign keys in {catalog_name}.{schema_name}")
+if federation_mode:
+    print("Federation mode: enabled (TABLESAMPLE replaced with LIMIT, apply_ddl forced off)")
+print(f"Column similarity threshold: {column_similarity_threshold}")
+print(f"Duplicate table similarity threshold: {duplicate_table_similarity_threshold}")
+print(f"Cross-block column similarity min: {cross_block_column_similarity_min}")
+print(f"Confidence threshold: {confidence_threshold}")
+print(f"Apply DDL: {apply_ddl}")
+print(f"Dry run: {dry_run}")
+print(f"Incremental (embedding path): {incremental}")
+print(f"Max AI candidates: {max_ai_candidates}")
+print(f"Rule score min for AI: {rule_score_min_for_ai}")
+print(f"Max candidates per table pair: {max_candidates_per_table_pair}")
+
+# COMMAND ----------
+
+import sys
+sys.path.append("../src")
+
+from dbxmetagen.table_filter import parse_table_names
+from dbxmetagen.fk_prediction import predict_foreign_keys
+
+table_names = parse_table_names(dbutils.widgets.get("table_names").strip()) or None
+
+_fk_kwargs = dict(
+    spark=spark,
+    catalog_name=catalog_name,
+    schema_name=schema_name,
+    column_similarity_threshold=column_similarity_threshold,
+    table_similarity_threshold=table_similarity_threshold,
+    duplicate_table_similarity_threshold=duplicate_table_similarity_threshold,
+    cross_block_column_similarity_min=cross_block_column_similarity_min,
+    cross_block_strict=cross_block_strict,
+    ontology_cross_block=ontology_cross_block,
+    skip_ai_for_declared_fk=skip_ai_for_declared_fk,
+    skip_ai_query_min_observations=skip_ai_query_min_observations,
+    confidence_threshold=confidence_threshold,
+    sample_size=sample_size,
+    apply_ddl=apply_ddl,
+    dry_run=dry_run,
+    incremental=incremental,
+    max_ai_candidates=max_ai_candidates,
+    rule_score_min_for_ai=rule_score_min_for_ai,
+    max_candidates_per_table_pair=max_candidates_per_table_pair,
+    same_schema_bonus=same_schema_bonus,
+    cross_schema_penalty=cross_schema_penalty,
+    federation_mode=federation_mode,
+    enable_data_overlap_candidates=enable_data_overlap_candidates,
+    fk_data_overlap_min_containment=fk_data_overlap_min_containment,
+    fk_data_overlap_min_containment_ontology=fk_data_overlap_min_containment_ontology,
+    fk_data_overlap_min_containment_distinctive=fk_data_overlap_min_containment_distinctive,
+    fk_data_overlap_min_distinct=fk_data_overlap_min_distinct,
+    fk_data_overlap_weight=fk_data_overlap_weight,
+    fk_data_overlap_max_candidates=fk_data_overlap_max_candidates,
+    fk_mirror_uniqueness_threshold=fk_mirror_uniqueness_threshold,
+)
+if system_column_patterns is not None:
+    _fk_kwargs["system_column_patterns"] = system_column_patterns
+if generic_column_names is not None:
+    _fk_kwargs["generic_column_names"] = generic_column_names
+_fk_kwargs["sweep_stale"] = sweep_stale
+if table_names:
+    _fk_kwargs["table_names"] = table_names
+    print(f"Table names filter: {table_names}")
+result = predict_foreign_keys(**_fk_kwargs)
+
+print("FK prediction complete")
+if result.get("dry_run"):
+    print("  DRY RUN - no AI calls made")
+    print(f"  Candidates found: {result.get('candidates', 0)}")
+    print(f"  Rows that would be sent to AI_QUERY: {result.get('ai_query_rows', 0)}")
+else:
+    print(f"  Candidates evaluated: {result.get('candidates', 0)}")
+    print(f"  Rows sent to AI_QUERY: {result.get('ai_query_rows', 0)}")
+    print(f"  Predictions written: {result.get('predictions', 0)}")
+    print(f"  Graph edges created: {result.get('edges', 0)}")
+    print(f"  DDL applied: {result.get('ddl_applied', 0)}")

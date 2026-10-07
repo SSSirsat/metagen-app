@@ -1,0 +1,750 @@
+"""Build a Databricks Vector Search index over enriched metadata documents.
+
+Creates a `metadata_documents` Delta table by joining table, column, entity,
+metric-view, and FK-relationship metadata, then provisions a VS endpoint and
+Delta Sync index with managed embeddings for similarity / hybrid retrieval.
+"""
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Dict, Any
+
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.vectorsearch import (
+    DeltaSyncVectorIndexSpecRequest,
+    EmbeddingSourceColumn,
+    EndpointType,
+    PipelineType,
+    VectorIndexType,
+)
+from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VectorIndexConfig:
+    catalog_name: str
+    schema_name: str
+    endpoint_name: str = "dbxmetagen-vs"
+    index_suffix: str = "metadata_vs_index"
+    documents_table: str = "metadata_documents"
+    embedding_model: str = "databricks-gte-large-en"
+    # First-time VS provisioning: poll get_index until status.ready
+    index_ready_timeout_s: int = 900
+    index_ready_initial_delay_s: int = 30
+    # sync_index can race with readiness; retry transient errors
+    sync_max_attempts: int = 5
+    sync_initial_delay_s: int = 30
+
+    @property
+    def fq_documents(self) -> str:
+        return f"{self.catalog_name}.{self.schema_name}.{self.documents_table}"
+
+    @property
+    def fq_index(self) -> str:
+        return f"{self.catalog_name}.{self.schema_name}.{self.index_suffix}"
+
+    def fq(self, table: str) -> str:
+        return f"{self.catalog_name}.{self.schema_name}.{table}"
+
+
+def _transient_vector_search_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "not ready" in msg
+
+
+_COLUMNS_TO_SYNC = [
+    "doc_id", "doc_type", "content", "node_id",
+    "catalog_name", "schema_name", "table_name",
+    "domain", "subdomain", "entity_type",
+    "has_pii", "has_phi", "security_level", "data_type",
+    "confidence_score",
+]
+
+
+class VectorIndexBuilder:
+    def __init__(self, spark: SparkSession, config: VectorIndexConfig, *,
+                 sweep_stale_docs: bool = False, incremental: bool = True):
+        self.spark = spark
+        self.config = config
+        self.sweep_stale_docs = sweep_stale_docs
+        self.incremental = incremental
+
+    def _check_incremental_watermark(self) -> bool:
+        """Return True if any tracked upstream watermark is newer than metadata_documents.updated_at.
+
+        Compares the global max timestamp across these sources (skipped if table missing/errors):
+        table_knowledge_base.updated_at, column_knowledge_base.updated_at,
+        ontology_entities.updated_at, metric_view_definitions.created_at,
+        fk_predictions.updated_at, community_summaries.generated_at.
+        """
+        cfg = self.config
+        upstream_tables = [
+            ("table_knowledge_base", "updated_at"),
+            ("column_knowledge_base", "updated_at"),
+            ("ontology_entities", "updated_at"),
+            ("metric_view_definitions", "created_at"),
+            ("fk_predictions", "updated_at"),
+            ("community_summaries", "generated_at"),
+        ]
+        max_upstream = None
+        for tbl, col in upstream_tables:
+            fq = cfg.fq(tbl)
+            try:
+                val = self.spark.sql(
+                    f"SELECT MAX({col}) AS mu FROM {fq}"
+                ).collect()[0].mu
+                if val and (max_upstream is None or val > max_upstream):
+                    max_upstream = val
+            except Exception:
+                pass
+        if max_upstream is None:
+            return True
+        try:
+            max_docs = self.spark.sql(
+                f"SELECT COALESCE(MAX(updated_at), TIMESTAMP '1970-01-01') AS mu FROM {cfg.fq_documents}"
+            ).collect()[0].mu
+        except Exception:
+            return True
+        return max_upstream > max_docs
+
+    def build_documents_table(self) -> int:
+        cfg = self.config
+        self.spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {cfg.fq_documents} (
+                doc_id STRING NOT NULL,
+                doc_type STRING,
+                content STRING,
+                node_id STRING,
+                catalog_name STRING,
+                schema_name STRING,
+                table_name STRING,
+                domain STRING,
+                subdomain STRING,
+                entity_type STRING,
+                has_pii BOOLEAN,
+                has_phi BOOLEAN,
+                security_level STRING,
+                data_type STRING,
+                confidence_score FLOAT,
+                updated_at TIMESTAMP
+            ) USING DELTA
+            TBLPROPERTIES (
+                'delta.enableChangeDataFeed' = 'true',
+                'delta.deletedFileRetentionDuration' = 'interval 30 days'
+            )
+        """)
+        # Backfill retention property for existing tables
+        try:
+            self.spark.sql(f"""
+                ALTER TABLE {cfg.fq_documents}
+                SET TBLPROPERTIES ('delta.deletedFileRetentionDuration' = 'interval 30 days')
+            """)
+        except Exception:
+            logger.debug("Could not set deletedFileRetentionDuration on %s", cfg.fq_documents)
+        # Migration for existing tables
+        try:
+            self.spark.sql(f"ALTER TABLE {cfg.fq_documents} ADD COLUMN node_id STRING")
+            logger.info("Added node_id column to %s", cfg.fq_documents)
+        except Exception as e:
+            if "already exists" in str(e).lower() or "FIELDS_ALREADY_EXISTS" in str(e):
+                pass
+            else:
+                logger.debug("Could not add node_id column: %s", e)
+
+        if self.incremental and not self._check_incremental_watermark():
+            count = self.spark.sql(
+                f"SELECT COUNT(*) AS cnt FROM {cfg.fq_documents}"
+            ).collect()[0]["cnt"]
+            logger.info("Incremental: no upstream changes, metadata_documents unchanged (%d rows)", count)
+            return count
+
+        table_docs = f"""
+            SELECT
+                CONCAT('table::', t.table_name) AS doc_id,
+                'table' AS doc_type,
+                t.table_name AS node_id,
+                CONCAT(
+                    COALESCE(t.comment, t.table_short_name), '\\n',
+                    'Domain: ', COALESCE(t.domain, 'unknown'),
+                    CASE WHEN t.subdomain IS NOT NULL THEN CONCAT(' / ', t.subdomain) ELSE '' END, '\\n',
+                    COALESCE(
+                        CONCAT('Primary entity: ',
+                            (SELECT o.entity_type
+                             FROM {cfg.fq('ontology_entities')} o
+                             WHERE ARRAY_CONTAINS(o.source_tables, t.table_name)
+                               AND COALESCE(o.entity_role, 'primary') = 'primary'
+                             LIMIT 1)),
+                        ''
+                    ), '\\n',
+                    COALESCE(
+                        CONCAT('Relationships: ',
+                            (SELECT CONCAT_WS('; ', COLLECT_SET(
+                                CONCAT(r.src_entity_type, ' -[', r.relationship_name, ']-> ', r.dst_entity_type)
+                            ))
+                             FROM {cfg.fq('ontology_relationships')} r
+                             JOIN {cfg.fq('ontology_entities')} oe ON oe.entity_type = r.src_entity_type
+                             WHERE ARRAY_CONTAINS(oe.source_tables, t.table_name))),
+                        ''
+                    ), '\\n',
+                    COALESCE(
+                        CONCAT('Column properties: ',
+                            (SELECT CONCAT_WS(', ', COLLECT_LIST(
+                                CONCAT(cp.column_name, '=', cp.property_role,
+                                       CASE WHEN cp.linked_entity_type IS NOT NULL THEN CONCAT('->', cp.linked_entity_type) ELSE '' END)
+                            ))
+                             FROM {cfg.fq('ontology_column_properties')} cp
+                             WHERE cp.table_name = t.table_name)),
+                        ''
+                    ), '\\n',
+                    'Columns (',
+                    CAST((SELECT COUNT(*) FROM {cfg.fq('column_knowledge_base')} c2 WHERE c2.table_name = t.table_name) AS STRING),
+                    '): ',
+                    COALESCE(
+                        (SELECT CONCAT_WS(', ', COLLECT_LIST(
+                            CONCAT(c.column_name, ' (', COALESCE(c.data_type, ''), ')')
+                         ))
+                         FROM {cfg.fq('column_knowledge_base')} c
+                         WHERE c.table_name = t.table_name),
+                        ''
+                    ), '\\n',
+                    COALESCE(
+                        CONCAT('FK joins: ',
+                            (SELECT CONCAT_WS('; ', COLLECT_SET(
+                                CONCAT(f.src_table, '.', f.src_column, ' -> ', f.dst_table, '.', f.dst_column,
+                                       ' [conf=', CAST(ROUND(f.final_confidence, 2) AS STRING), ']')
+                            ))
+                             FROM {cfg.fq('fk_predictions')} f
+                             WHERE (f.src_table = t.table_name OR f.dst_table = t.table_name)
+                               AND f.final_confidence >= 0.5
+                               AND (f.is_fk IS NULL OR f.is_fk = TRUE))),
+                        ''
+                    ), '\\n',
+                    'Row count: ', COALESCE(CAST(
+                        (SELECT p.row_count FROM {cfg.fq('profiling_snapshots')} p
+                         WHERE p.table_name = t.table_name
+                         ORDER BY p.snapshot_time DESC LIMIT 1) AS STRING), 'unknown')
+                ) AS content,
+                t.catalog AS catalog_name,
+                t.schema AS schema_name,
+                t.table_name,
+                t.domain,
+                t.subdomain,
+                CAST(NULL AS STRING) AS entity_type,
+                t.has_pii,
+                t.has_phi,
+                CAST(NULL AS STRING) AS security_level,
+                CAST(NULL AS STRING) AS data_type,
+                CAST(NULL AS FLOAT) AS confidence_score,
+                current_timestamp() AS updated_at
+            FROM {cfg.fq('table_knowledge_base')} t
+        """
+
+        column_docs = f"""
+            SELECT
+                CONCAT('column::', c.table_name, '.', c.column_name) AS doc_id,
+                'column' AS doc_type,
+                c.column_id AS node_id,
+                CONCAT(
+                    c.column_name, ' (', COALESCE(c.data_type, 'unknown'), ')\\n',
+                    COALESCE(c.comment, ''), '\\n',
+                    'Table: ', COALESCE(c.table_name, ''),
+                    COALESCE(
+                        CONCAT(' [domain: ',
+                            (SELECT t2.domain FROM {cfg.fq('table_knowledge_base')} t2 WHERE t2.table_name = c.table_name LIMIT 1),
+                        ']'), ''
+                    ), '\\n',
+                    CASE WHEN c.classification IS NOT NULL
+                         THEN CONCAT('Classification: ', c.classification, ' (', COALESCE(c.classification_type, ''), ')\\n')
+                         ELSE '' END,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM {cfg.fq('fk_predictions')} fk
+                        WHERE ((fk.src_table = c.table_name AND fk.src_column = c.column_name)
+                           OR (fk.dst_table = c.table_name AND fk.dst_column = c.column_name))
+                          AND (fk.is_fk IS NULL OR fk.is_fk = TRUE)
+                    ) THEN 'Role: FK column' ELSE '' END
+                ) AS content,
+                c.catalog AS catalog_name,
+                c.schema AS schema_name,
+                c.table_name,
+                CAST(NULL AS STRING) AS domain,
+                CAST(NULL AS STRING) AS subdomain,
+                CAST(NULL AS STRING) AS entity_type,
+                CAST(NULL AS BOOLEAN) AS has_pii,
+                CAST(NULL AS BOOLEAN) AS has_phi,
+                CAST(NULL AS STRING) AS security_level,
+                c.data_type,
+                CAST(NULL AS FLOAT) AS confidence_score,
+                current_timestamp() AS updated_at
+            FROM {cfg.fq('column_knowledge_base')} c
+            WHERE c.comment IS NOT NULL AND LENGTH(c.comment) > 5
+        """
+
+        entity_docs = f"""
+            SELECT
+                CONCAT('entity::', o.entity_id) AS doc_id,
+                'entity' AS doc_type,
+                o.entity_id AS node_id,
+                CONCAT(
+                    o.entity_name, ' (', o.entity_type, ') [', COALESCE(o.entity_role, 'primary'), ']\\n',
+                    COALESCE(o.description, ''), '\\n',
+                    'Source tables: ', COALESCE(CONCAT_WS(', ', o.source_tables), ''), '\\n',
+                    COALESCE(
+                        CONCAT('Named relationships: ',
+                            (SELECT CONCAT_WS('; ', COLLECT_SET(
+                                CONCAT(r.src_entity_type, ' -[', r.relationship_name, ']-> ', r.dst_entity_type)
+                            ))
+                             FROM {cfg.fq('ontology_relationships')} r
+                             WHERE r.src_entity_type = o.entity_type OR r.dst_entity_type = o.entity_type)),
+                        ''
+                    ), '\\n',
+                    COALESCE(
+                        CONCAT('Column properties: ',
+                            (SELECT CONCAT_WS(', ', COLLECT_LIST(
+                                CONCAT(cp.column_name, '=', cp.property_role,
+                                       CASE WHEN cp.linked_entity_type IS NOT NULL THEN CONCAT('->', cp.linked_entity_type) ELSE '' END)
+                            ))
+                             FROM {cfg.fq('ontology_column_properties')} cp
+                             WHERE cp.owning_entity_id = o.entity_id)),
+                        ''
+                    ), '\\n',
+                    'Confidence: ', CAST(o.confidence AS STRING)
+                ) AS content,
+                CAST(NULL AS STRING) AS catalog_name,
+                CAST(NULL AS STRING) AS schema_name,
+                CAST(NULL AS STRING) AS table_name,
+                CAST(NULL AS STRING) AS domain,
+                CAST(NULL AS STRING) AS subdomain,
+                o.entity_type,
+                CAST(NULL AS BOOLEAN) AS has_pii,
+                CAST(NULL AS BOOLEAN) AS has_phi,
+                CAST(NULL AS STRING) AS security_level,
+                CAST(NULL AS STRING) AS data_type,
+                CAST(o.confidence AS FLOAT) AS confidence_score,
+                current_timestamp() AS updated_at
+            FROM {cfg.fq('ontology_entities')} o
+            WHERE o.confidence >= 0.4
+        """
+
+        # Single CTE for all three metric view document tiers (parsed once)
+        _kb = cfg.fq('table_knowledge_base')
+        _defs = cfg.fq('metric_view_definitions')
+        _null_cols = (
+            "CAST(NULL AS STRING) AS catalog_name, CAST(NULL AS STRING) AS schema_name, "
+            "p.source_table AS table_name, kb.domain AS domain, kb.subdomain AS subdomain, "
+            "CAST(NULL AS STRING) AS entity_type, CAST(NULL AS BOOLEAN) AS has_pii, "
+            "CAST(NULL AS BOOLEAN) AS has_phi, CAST(NULL AS STRING) AS security_level, "
+            "CAST(NULL AS STRING) AS data_type, CAST(NULL AS FLOAT) AS confidence_score, "
+            "current_timestamp() AS updated_at"
+        )
+        _join = f"FROM mv_base p LEFT JOIN {_kb} kb ON p.source_table = kb.table_name"
+
+        metric_docs = f"""
+            SELECT * FROM (
+            WITH mv_base AS (
+                SELECT
+                    m.definition_id, m.metric_view_name, m.source_table, m.source_questions,
+                    CONCAT(COALESCE(m.deployed_catalog, '{cfg.catalog_name}'), '.', COALESCE(m.deployed_schema, '{cfg.schema_name}'), '.', m.metric_view_name) AS mv_fqn,
+                    FROM_JSON(m.json_definition, 'STRUCT<comment:STRING>').comment AS mv_comment,
+                    FROM_JSON(m.json_definition, 'STRUCT<filter:STRING>').filter AS mv_filter,
+                    CONCAT_WS('\\n', TRANSFORM(
+                        FROM_JSON(m.json_definition, 'STRUCT<measures:ARRAY<STRUCT<name:STRING,display_name:STRING,expr:STRING,comment:STRING,synonyms:ARRAY<STRING>,format:STRUCT<type:STRING,currency_code:STRING>>>>').measures,
+                        x -> CONCAT('- ', x.name, COALESCE(CONCAT(' (', x.display_name, ')'), ''), ': ', COALESCE(x.comment, ''), ' [', COALESCE(x.expr, ''), ']',
+                                    CASE WHEN x.format IS NOT NULL THEN CONCAT(' (', x.format.type, COALESCE(CONCAT(' ', x.format.currency_code), ''), ')') ELSE '' END,
+                                    CASE WHEN x.synonyms IS NOT NULL THEN CONCAT(' (aka: ', ARRAY_JOIN(x.synonyms, ', '), ')') ELSE '' END)
+                    )) AS measure_lines,
+                    CONCAT_WS('\\n', TRANSFORM(
+                        FROM_JSON(m.json_definition, 'STRUCT<dimensions:ARRAY<STRUCT<name:STRING,display_name:STRING,expr:STRING,comment:STRING,synonyms:ARRAY<STRING>>>>').dimensions,
+                        x -> CONCAT('- ', x.name, COALESCE(CONCAT(' (', x.display_name, ')'), ''), ': ', COALESCE(x.comment, ''), ' [', COALESCE(x.expr, ''), ']',
+                                    CASE WHEN x.synonyms IS NOT NULL THEN CONCAT(' (aka: ', ARRAY_JOIN(x.synonyms, ', '), ')') ELSE '' END)
+                    )) AS dimension_lines,
+                    CONCAT_WS('\\n', TRANSFORM(
+                        FROM_JSON(m.json_definition, 'STRUCT<joins:ARRAY<STRUCT<name:STRING,source:STRING,on:STRING>>>').joins,
+                        x -> CONCAT('- ', x.name, ': ', COALESCE(x.source, ''), ' ON ', COALESCE(x.on, ''))
+                    )) AS join_lines,
+                    COALESCE(CONCAT('Keywords: ', ARRAY_JOIN(ARRAY_UNION(
+                        FLATTEN(TRANSFORM(FROM_JSON(m.json_definition, 'STRUCT<measures:ARRAY<STRUCT<synonyms:ARRAY<STRING>>>>').measures, x -> COALESCE(x.synonyms, ARRAY()))),
+                        FLATTEN(TRANSFORM(FROM_JSON(m.json_definition, 'STRUCT<dimensions:ARRAY<STRUCT<synonyms:ARRAY<STRING>>>>').dimensions, x -> COALESCE(x.synonyms, ARRAY())))
+                    ), ', ')), '') AS all_synonyms_line
+                FROM {_defs} m WHERE m.status = 'applied'
+            )
+            SELECT CONCAT('metric_view_summary::', p.definition_id) AS doc_id, 'metric_view_summary' AS doc_type, p.definition_id AS node_id,
+                CONCAT(p.mv_fqn, '\\n', COALESCE(p.mv_comment, ''), '\\n', 'Domain: ', COALESCE(kb.domain, ''), ' / ', COALESCE(kb.subdomain, ''), '\\n',
+                       'Source: ', COALESCE(p.source_table, ''), '\\n', 'Questions: ', COALESCE(p.source_questions, ''), '\\n', COALESCE(p.all_synonyms_line, '')) AS content,
+                {_null_cols} {_join}
+            UNION ALL
+            SELECT CONCAT('metric_view_measures::', p.definition_id) AS doc_id, 'metric_view_measures' AS doc_type, p.definition_id AS node_id,
+                CONCAT(p.mv_fqn, '\\nMeasures:\\n', COALESCE(p.measure_lines, '(none)'), '\\n', COALESCE(p.all_synonyms_line, '')) AS content,
+                {_null_cols} {_join}
+            UNION ALL
+            SELECT CONCAT('metric_view_schema::', p.definition_id) AS doc_id, 'metric_view_schema' AS doc_type, p.definition_id AS node_id,
+                CONCAT(p.mv_fqn, '\\nDimensions:\\n', COALESCE(p.dimension_lines, '(none)'), '\\nJoins:\\n', COALESCE(p.join_lines, '(none)'), '\\nFilter: ', COALESCE(p.mv_filter, '(none)')) AS content,
+                {_null_cols} {_join}
+            )
+        """
+
+        fk_docs = f"""
+            SELECT
+                CONCAT('fk::', f.src_table, '.', f.src_column, '->', f.dst_table, '.', f.dst_column) AS doc_id,
+                'fk_relationship' AS doc_type,
+                f.src_table AS node_id,
+                CONCAT(
+                    'Foreign key: ', f.src_table, '.', f.src_column,
+                    ' references ', f.dst_table, '.', f.dst_column, '\\n',
+                    'Join: SELECT * FROM ', f.src_table, ' JOIN ', f.dst_table,
+                    ' ON ', f.src_table, '.', f.src_column, ' = ', f.dst_table, '.', f.dst_column, '\\n',
+                    'Confidence: ', CAST(ROUND(f.final_confidence, 3) AS STRING), '\\n',
+                    COALESCE(CONCAT('PK Uniqueness: ', CAST(ROUND(f.pk_uniqueness, 3) AS STRING)), ''), '\\n',
+                    COALESCE(CONCAT('Reasoning: ', f.ai_reasoning), '')
+                ) AS content,
+                CAST(NULL AS STRING) AS catalog_name,
+                CAST(NULL AS STRING) AS schema_name,
+                f.src_table AS table_name,
+                CAST(NULL AS STRING) AS domain,
+                CAST(NULL AS STRING) AS subdomain,
+                CAST(NULL AS STRING) AS entity_type,
+                CAST(NULL AS BOOLEAN) AS has_pii,
+                CAST(NULL AS BOOLEAN) AS has_phi,
+                CAST(NULL AS STRING) AS security_level,
+                CAST(NULL AS STRING) AS data_type,
+                CAST(f.final_confidence AS FLOAT) AS confidence_score,
+                current_timestamp() AS updated_at
+            FROM {cfg.fq('fk_predictions')} f
+            WHERE f.final_confidence >= 0.5
+              AND (f.is_fk IS NULL OR f.is_fk = TRUE)
+        """
+
+        community_docs = f"""
+            SELECT
+                CONCAT('community::', cs.community_id) AS doc_id,
+                'community_summary' AS doc_type,
+                cs.community_id AS node_id,
+                CONCAT(COALESCE(cs.domain, 'unknown'), ' / ', COALESCE(cs.subdomain, 'general'), ': ', cs.summary) AS content,
+                CAST(NULL AS STRING) AS catalog_name,
+                CAST(NULL AS STRING) AS schema_name,
+                CAST(NULL AS STRING) AS table_name,
+                cs.domain AS domain,
+                cs.subdomain AS subdomain,
+                CAST(NULL AS STRING) AS entity_type,
+                CAST(NULL AS BOOLEAN) AS has_pii,
+                CAST(NULL AS BOOLEAN) AS has_phi,
+                CAST(NULL AS STRING) AS security_level,
+                CAST(NULL AS STRING) AS data_type,
+                CAST(NULL AS FLOAT) AS confidence_score,
+                current_timestamp() AS updated_at
+            FROM {cfg.fq('community_summaries')} cs
+            WHERE cs.summary IS NOT NULL
+        """
+
+        parts = [table_docs, column_docs]
+        included_sources = {"table_knowledge_base", "column_knowledge_base"}
+        for tbl, sql in [
+            ("ontology_entities", entity_docs),
+            ("metric_view_definitions", metric_docs),
+            ("fk_predictions", fk_docs),
+            ("community_summaries", community_docs),
+        ]:
+            if self.spark.catalog.tableExists(cfg.fq(tbl)):
+                parts.append(sql)
+                included_sources.add(tbl)
+            else:
+                logger.info("Skipping %s (table does not exist)", tbl)
+
+        union_body = "\nUNION ALL\n".join(parts)
+
+        # Content-change guard: only update when doc body or doc_type differs (covers same doc_id
+        # repurposed across types without no-op rewriting), avoiding updated_at churn and VS re-embedding.
+        union_sql = f"""
+            MERGE INTO {cfg.fq_documents} AS tgt
+            USING (
+                {union_body}
+            ) AS src
+            ON tgt.doc_id = src.doc_id
+            WHEN MATCHED AND (
+                COALESCE(tgt.content, '') != COALESCE(src.content, '')
+                OR COALESCE(tgt.doc_type, '') != COALESCE(src.doc_type, '')
+            ) THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """
+
+        self.spark.sql(union_sql)
+
+        if self.sweep_stale_docs:
+            self._sweep_stale_documents(included_sources)
+
+        count = self.spark.sql(f"SELECT COUNT(*) AS cnt FROM {cfg.fq_documents}").collect()[0]["cnt"]
+        logger.info("metadata_documents now has %d rows", count)
+        return count
+
+    def _sweep_stale_documents(self, included_sources: set) -> None:
+        """Delete orphaned docs whose source rows no longer exist.
+
+        Only sweeps doc_types whose source table was included in the MERGE
+        AND has qualifying rows (same WHERE clauses as the MERGE source queries).
+        CDF propagates these deletes to the Delta Sync VS index automatically.
+        """
+        cfg = self.config
+        docs = cfg.fq_documents
+
+        sweep_specs = [
+            ("table", "table_knowledge_base",
+             f"SELECT table_name AS key FROM {cfg.fq('table_knowledge_base')}",
+             f"DELETE FROM {docs} WHERE doc_type = 'table'"
+             f" AND REPLACE(doc_id, 'table::', '')"
+             f" NOT IN (SELECT table_name FROM {cfg.fq('table_knowledge_base')})"),
+            ("column", "column_knowledge_base",
+             f"SELECT 1 FROM {cfg.fq('column_knowledge_base')}"
+             f" WHERE comment IS NOT NULL AND LENGTH(comment) > 5 LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'column'"
+             f" AND REPLACE(doc_id, 'column::', '')"
+             f" NOT IN (SELECT CONCAT(table_name, '.', column_name)"
+             f" FROM {cfg.fq('column_knowledge_base')}"
+             f" WHERE comment IS NOT NULL AND LENGTH(comment) > 5)"),
+            ("entity", "ontology_entities",
+             f"SELECT 1 FROM {cfg.fq('ontology_entities')}"
+             f" WHERE confidence >= 0.4 LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'entity'"
+             f" AND node_id NOT IN"
+             f" (SELECT entity_id FROM {cfg.fq('ontology_entities')}"
+             f" WHERE confidence >= 0.4)"),
+            # One-time migration: remove legacy single-doc metric_view entries
+            ("metric_view", "metric_view_definitions",
+             f"SELECT 1 FROM {docs} WHERE doc_type = 'metric_view' LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'metric_view'"),
+            ("metric_view_summary", "metric_view_definitions",
+             f"SELECT 1 FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied') LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'metric_view_summary'"
+             f" AND node_id NOT IN"
+             f" (SELECT definition_id FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied'))"),
+            ("metric_view_measures", "metric_view_definitions",
+             f"SELECT 1 FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied') LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'metric_view_measures'"
+             f" AND node_id NOT IN"
+             f" (SELECT definition_id FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied'))"),
+            ("metric_view_schema", "metric_view_definitions",
+             f"SELECT 1 FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied') LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'metric_view_schema'"
+             f" AND node_id NOT IN"
+             f" (SELECT definition_id FROM {cfg.fq('metric_view_definitions')}"
+             f" WHERE status IN ('validated', 'applied'))"),
+            ("fk_relationship", "fk_predictions",
+             f"SELECT 1 FROM {cfg.fq('fk_predictions')}"
+             f" WHERE final_confidence >= 0.5"
+             f" AND (is_fk IS NULL OR is_fk = TRUE) LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'fk_relationship'"
+             f" AND doc_id NOT IN"
+             f" (SELECT CONCAT('fk::', src_table, '.', src_column,"
+             f" '->', dst_table, '.', dst_column)"
+             f" FROM {cfg.fq('fk_predictions')}"
+             f" WHERE final_confidence >= 0.5"
+             f" AND (is_fk IS NULL OR is_fk = TRUE))"),
+            ("community_summary", "community_summaries",
+             f"SELECT 1 FROM {cfg.fq('community_summaries')}"
+             f" WHERE summary IS NOT NULL LIMIT 1",
+             f"DELETE FROM {docs} WHERE doc_type = 'community_summary'"
+             f" AND node_id NOT IN"
+             f" (SELECT community_id FROM {cfg.fq('community_summaries')}"
+             f" WHERE summary IS NOT NULL)"),
+        ]
+
+        for doc_type, source_table, guard_sql, delete_sql in sweep_specs:
+            if source_table not in included_sources:
+                continue
+            try:
+                has_rows = bool(self.spark.sql(guard_sql).head(1))
+            except Exception:
+                has_rows = False
+            if not has_rows:
+                logger.warning(
+                    "Skipping sweep for doc_type=%s: source query returned 0 rows "
+                    "(upstream may not have run yet)", doc_type,
+                )
+                continue
+
+            before = self.spark.sql(
+                f"SELECT COUNT(*) AS c FROM {docs} WHERE doc_type = '{doc_type}'"
+            ).collect()[0]["c"]
+
+            # DELETE: Removes stale `metadata_documents` rows for the current `doc_type`
+            # when their natural keys no longer appear in the upstream source table (per the
+            # paired `delete_sql`: e.g. strip `table::` prefix vs `table_knowledge_base.table_name`,
+            # `column::`-qualified names vs commented columns, `entity`/`metric_view`/`fk_relationship`
+            # via `node_id` or `doc_id` against ontology/metric/FK predictions with the same
+            # filters as the MERGE union). Only runs when that source was part of the merge
+            # batch and the guard query proves non-empty upstream data.
+            # WHY: MERGE alone cannot drop docs that disappeared from KB/ontology/FK outputs;
+            # without deletes, Vector Search would keep embedding stale text and pollute RAG.
+            # Delta Sync propagates these deletes so the index sheds orphaned vectors.
+            # TRADEOFFS: Per-type `NOT IN`/`NOT IN (subquery)` deletes are simple and aligned
+            # with MERGE filters, but can be heavy on very large tables and behave poorly if
+            # NULLs appear in keys; skipping sweep when upstream is empty avoids wiping docs
+            # during partial pipeline runs but can temporarily retain stale rows until a full run.
+
+            self.spark.sql(delete_sql)
+            after = self.spark.sql(
+                f"SELECT COUNT(*) AS c FROM {docs} WHERE doc_type = '{doc_type}'"
+            ).collect()[0]["c"]
+            removed = before - after
+            if removed > 0:
+                logger.info("Swept %d stale '%s' docs (%d -> %d)", removed, doc_type, before, after)
+            else:
+                logger.info("No stale '%s' docs to sweep", doc_type)
+
+    def ensure_endpoint(self) -> str:
+        w = WorkspaceClient()
+        name = self.config.endpoint_name
+        try:
+            ep = w.vector_search_endpoints.get_endpoint(name)
+            logger.info(
+                "VS endpoint '%s' exists (state=%s, message=%s, num_indexes=%s)",
+                name, ep.endpoint_status.state, ep.endpoint_status.message, ep.num_indexes,
+            )
+        except Exception:
+            logger.info("Creating VS endpoint '%s'", name)
+            w.vector_search_endpoints.create_endpoint(name=name, endpoint_type=EndpointType.STANDARD)
+
+        ep = w.vector_search_endpoints.wait_get_endpoint_vector_search_endpoint_online(name)
+        logger.info("VS endpoint '%s' confirmed ONLINE (num_indexes=%s)", name, ep.num_indexes)
+        return name
+
+    def _wait_until_index_ready(self, idx_name: str) -> None:
+        w = WorkspaceClient()
+        deadline = time.monotonic() + self.config.index_ready_timeout_s
+        delay = float(self.config.index_ready_initial_delay_s)
+        while True:
+            idx = w.vector_search_indexes.get_index(idx_name)
+            st = idx.status
+            ready = bool(st and st.ready)
+            if ready:
+                logger.info(
+                    "VS index '%s' is ready (indexed_rows=%s)",
+                    idx_name,
+                    getattr(st, "indexed_row_count", None) if st else None,
+                )
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            logger.info(
+                "VS index '%s' not ready yet (ready=%s, message=%s); sleeping %.0fs (%.0fs left)",
+                idx_name,
+                getattr(st, "ready", None) if st else None,
+                getattr(st, "message", None) if st else None,
+                min(delay, remaining),
+                remaining,
+            )
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2.0, 120.0)
+
+        raise TimeoutError(
+            f"VS index '{idx_name}' did not become ready within {self.config.index_ready_timeout_s}s"
+        )
+
+    def ensure_index(self) -> str:
+        w = WorkspaceClient()
+        idx_name = self.config.fq_index
+        try:
+            idx = w.vector_search_indexes.get_index(idx_name)
+            logger.info(
+                "VS index '%s' already exists (ready=%s, message=%s, indexed_rows=%s)",
+                idx_name, idx.status.ready, idx.status.message, idx.status.indexed_row_count,
+            )
+        except Exception:
+            logger.info("Creating Delta Sync index '%s' with managed embeddings", idx_name)
+            max_attempts, delay = 5, 30
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    w.vector_search_indexes.create_index(
+                        name=idx_name,
+                        endpoint_name=self.config.endpoint_name,
+                        primary_key="doc_id",
+                        index_type=VectorIndexType.DELTA_SYNC,
+                        delta_sync_index_spec=DeltaSyncVectorIndexSpecRequest(
+                            source_table=self.config.fq_documents,
+                            embedding_source_columns=[
+                                EmbeddingSourceColumn(
+                                    name="content",
+                                    embedding_model_endpoint_name=self.config.embedding_model,
+                                )
+                            ],
+                            pipeline_type=PipelineType.TRIGGERED,
+                            columns_to_sync=_COLUMNS_TO_SYNC,
+                        ),
+                    )
+                    logger.info("create_index succeeded on attempt %d", attempt)
+                    break
+                except Exception as e:
+                    if _transient_vector_search_error(e) and attempt < max_attempts:
+                        logger.warning(
+                            "create_index attempt %d/%d failed: %s -- retrying in %ds",
+                            attempt, max_attempts, e, delay,
+                        )
+                        time.sleep(delay)
+                        delay = min(delay * 2, 120)
+                    else:
+                        raise
+
+        self._wait_until_index_ready(idx_name)
+        return idx_name
+
+    def sync(self):
+        w = WorkspaceClient()
+        idx_name = self.config.fq_index
+        max_attempts = self.config.sync_max_attempts
+        delay = float(self.config.sync_initial_delay_s)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(
+                    "Triggering sync for '%s' (attempt %d/%d)",
+                    idx_name, attempt, max_attempts,
+                )
+                w.vector_search_indexes.sync_index(index_name=idx_name)
+                return
+            except Exception as e:
+                if _transient_vector_search_error(e) and attempt < max_attempts:
+                    logger.warning(
+                        "sync_index attempt %d/%d failed: %s -- retrying in %.0fs",
+                        attempt, max_attempts, e, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 120.0)
+                else:
+                    raise
+
+    def run(self) -> Dict[str, Any]:
+        doc_count = self.build_documents_table()
+        endpoint = self.ensure_endpoint()
+        index = self.ensure_index()
+        self.sync()
+        return {
+            "documents": doc_count,
+            "endpoint": endpoint,
+            "index": index,
+        }
+
+
+def build_vector_index(
+    spark: SparkSession,
+    catalog_name: str,
+    schema_name: str,
+    endpoint_name: str = "dbxmetagen-vs",
+    sweep_stale_docs: bool = False,
+    table_names=None,
+    incremental: bool = True,
+) -> Dict[str, Any]:
+    """Convenience entry point for the notebook."""
+    config = VectorIndexConfig(
+        catalog_name=catalog_name,
+        schema_name=schema_name,
+        endpoint_name=endpoint_name,
+    )
+    builder = VectorIndexBuilder(spark, config, sweep_stale_docs=sweep_stale_docs,
+                                  incremental=incremental)
+    return builder.run()

@@ -1,0 +1,441 @@
+from abc import ABC, abstractmethod
+import json
+import logging
+from pydantic import ValidationError
+from typing import Literal, Tuple, Dict, List, Any, Union, Optional
+from openai.types.chat.chat_completion import ChatCompletion
+from pydantic import BaseModel, ConfigDict, field_validator, PrivateAttr
+from dbxmetagen.config import MetadataConfig
+from dbxmetagen.error_handling import exponential_backoff
+from dbxmetagen.chat_client import ChatClientFactory
+
+logger = logging.getLogger(__name__)
+
+
+class Response(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    table: str
+    columns: List[str]
+    # Real (source-of-truth) table column names for the chunk this response covers.
+    # A PrivateAttr, so it is NOT part of the JSON schema sent to the model and does not
+    # trip `extra="forbid"`. Set post-generation (processing.get_generated_metadata_data_aware)
+    # where the chunk DataFrame is still in scope, and used by append_column_rows() to resolve
+    # descriptions to columns BY NAME rather than by position. None => not captured (fall back
+    # to positional pairing for backward compatibility).
+    _source_columns: Optional[List[str]] = PrivateAttr(default=None)
+
+
+PI_CLASSIFICATIONS = Literal["pi", "phi", "pci", "medical_information", "None"]
+_VALID_CLASSIFICATIONS = {"pi", "phi", "pci", "medical_information", "None"}
+
+class PIColumnContent(BaseModel):
+    classification: PI_CLASSIFICATIONS
+    type: str
+    confidence: float
+
+    @field_validator("classification", mode="before")
+    @classmethod
+    def normalize_classification(cls, v: str) -> str:
+        mapping = {
+            "pii": "pi", "personally_identifiable_information": "pi",
+            "protected_health_information": "phi",
+            "payment_card_information": "pci", "payment_card_industry": "pci",
+            "medical": "medical_information", "medical_info": "medical_information",
+            "none": "None", "null": "None", "n/a": "None", "": "None",
+            "non-pii/phi/pci": "None", "non_pii": "None",
+        }
+        normalized = str(v).strip().lower()
+        result = mapping.get(normalized, normalized)
+        if result not in _VALID_CLASSIFICATIONS:
+            logger.warning("Unexpected PII classification '%s' from LLM, defaulting to 'None'", v)
+            return "None"
+        return result
+
+
+class PIResponse(Response):
+    model_config = ConfigDict(extra="forbid")
+    column_contents: List[PIColumnContent]
+    presidio_results: Optional[str] = None
+
+
+class CommentResponse(Response):
+    model_config = ConfigDict(extra="forbid")
+    column_contents: Union[str, list[str]]
+
+    @field_validator("column_contents", mode="before")
+    @classmethod
+    def validate_column_contents(cls, v):
+        """Convert string to list if needed, flatten nested lists, parse stringified arrays."""
+        if v is None:
+            return []
+
+        def try_parse_stringified_array(s):
+            """Try to parse a string as a JSON array. Returns (success, parsed_list_or_original)."""
+            if isinstance(s, str):
+                stripped = s.strip()
+                if stripped.startswith("["):
+                    if not stripped.endswith("]"):
+                        if stripped.endswith('"') or stripped.endswith("'"):
+                            stripped = stripped + "]"
+                        else:
+                            last = stripped.rfind('",')
+                            if last == -1:
+                                last = stripped.rfind("',")
+                            if last > 0:
+                                stripped = stripped[: last + 1] + "]"
+
+                    _to_list = lambda parsed: [
+                        str(item) if not isinstance(item, str) else item
+                        for item in parsed
+                    ]
+
+                    for attempt in range(3):
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, list):
+                                return True, _to_list(parsed)
+                            break
+                        except json.JSONDecodeError:
+                            if attempt == 0:
+                                stripped = stripped.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+                            elif stripped.endswith("]]"):
+                                stripped = stripped[:-1]
+                            else:
+                                break
+
+                    import re
+                    elements = re.findall(r'"((?:[^"\\]|\\.)*)"', stripped)
+                    if elements:
+                        return True, elements
+            return False, s
+
+        if isinstance(v, str):
+            # Check if it's a stringified JSON array
+            success, result = try_parse_stringified_array(v)
+            if success:
+                return result
+            return [v]
+        elif isinstance(v, list):
+            # Handle nested list case: [[desc1, desc2, ...]] -> [desc1, desc2, ...]
+            if len(v) == 1 and isinstance(v[0], list):
+                v = v[0]
+
+            # Handle case where list has ONE element that is a stringified multi-element array
+            # e.g., ["[\"desc1\", \"desc2\", \"desc3\"]"] -> ["desc1", "desc2", "desc3"]
+            if len(v) == 1 and isinstance(v[0], str):
+                success, result = try_parse_stringified_array(v[0])
+                if success and len(result) > 1:
+                    return result
+
+            # Process each element, expanding any stringified arrays
+            expanded = []
+            for item in v:
+                success, result = try_parse_stringified_array(item)
+                if success:
+                    expanded.extend(result)
+                else:
+                    if isinstance(item, list):
+                        expanded.append("\n\n".join(str(x) for x in item))
+                    else:
+                        expanded.append(str(item) if not isinstance(item, str) else item)
+            return expanded
+        else:
+            raise ValueError(
+                "column_contents must be either a string or a list of strings"
+            )
+
+
+class SummaryCommentResponse(Response):
+    pass
+
+
+class MetadataGenerator(ABC):
+    def from_context(self, config):
+        self.config = config
+        self.chat_client = ChatClientFactory.create_client(config)
+
+    @abstractmethod
+    def get_responses(
+        self, prompt=None, prompt_content=None
+    ) -> Tuple[Response, ChatCompletion]:
+        """Abstract method to get responses from the chat client.
+
+        Args:
+            prompt: The prompt to use for the chat client.
+            prompt_content: The prompt content to use for the chat client.
+        """
+
+
+class CommentGenerator(MetadataGenerator):
+    """
+    Generate comments for a table.
+
+    Args:
+        MetadataGenerator: The parent class.
+    """
+
+    def get_responses(
+        self, prompt, prompt_content
+    ) -> Tuple[CommentResponse, ChatCompletion]:
+
+        prompt_size = len(json.dumps(prompt))
+        if prompt_size > self.config.max_prompt_length * 5:
+            raise ValueError(
+                f"The prompt template is too long ({prompt_size} chars). Please reduce the "
+                f"number of columns or increase the max_prompt_length."
+            )
+        comment_response, message_payload = self.get_comment_response(
+            self.config,
+            content=prompt_content,
+            prompt_content=prompt[self.config.mode],
+            model=self.config.model,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+        )
+        return comment_response, message_payload
+
+    def predict_chat_response(self, prompt_content):
+        """
+        Predict the chat response using the appropriate chat client.
+        """
+        self.chat_response = self.chat_client.create_structured_completion(
+            messages=prompt_content,
+            response_model=CommentResponse,
+            model=self.config.model,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+        )
+        return self.chat_response
+
+    def get_comment_response(
+        self,
+        config: MetadataConfig,
+        content: str,
+        prompt_content: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        retries: int = 0,
+        max_retries: int = 5,
+    ) -> Tuple[CommentResponse, Dict[str, Any]]:
+        try:
+            chat_response = self._get_chat_completion(
+                config, prompt_content, model, max_tokens, temperature
+            )
+            response_payload = None
+            return chat_response, response_payload
+        except (ValidationError, json.JSONDecodeError, AttributeError) as e:
+            if retries < max_retries:
+                logger.warning("Attempt %d failed, retrying: %s", retries + 1, e)
+                return self.get_comment_response(
+                    config,
+                    content,
+                    prompt_content,
+                    model,
+                    max_tokens,
+                    temperature,
+                    retries + 1,
+                    max_retries,
+                )
+            else:
+                raise ValueError(f"Validation error after {max_retries} attempts: {e}")
+
+    def _get_chat_completion(
+        self,
+        config: MetadataConfig,
+        prompt_content: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        retries: int = 0,
+        max_retries: int = 3,
+    ) -> ChatCompletion:
+        try:
+            return self.predict_chat_response(prompt_content)
+        except Exception as e:
+            if retries < max_retries:
+                logger.warning("[RETRY] Error: %s. Retrying in %ds...", e, 2 ** retries)
+                exponential_backoff(retries)
+                return self._get_chat_completion(
+                    config,
+                    prompt_content,
+                    model,
+                    max_tokens,
+                    temperature,
+                    retries + 1,
+                    max_retries,
+                )
+            else:
+                raise e
+
+    def _parse_response(self, response: str) -> Dict[str, Any]:
+        try:
+            response_dict = json.loads(response)
+            if not isinstance(response_dict, dict):
+                raise ValueError("Response is not a valid dict")
+            return response_dict
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON decode error: {e}")
+
+    def _validate_response(self, content: str, response_dict: Dict[str, Any]) -> None:
+        if not self._check_list_and_dict_keys_match(
+            content["column_contents"]["columns"], response_dict["columns"]
+        ):
+            raise ValueError("Column names do not match column contents")
+
+    @staticmethod
+    def _check_list_and_dict_keys_match(dict_list, string_list):
+        if isinstance(dict_list, list):
+            dict_keys = dict_list
+        else:
+            try:
+                dict_keys = dict_list.keys()
+            except Exception:
+                raise TypeError("dict_list is not a list or a dictionary")
+        list_matches_keys = all(item in dict_keys for item in string_list)
+        keys_match_list = all(key in string_list for key in dict_keys)
+        if not (list_matches_keys and keys_match_list):
+            return False
+        return True
+
+
+class PIIdentifier(MetadataGenerator):
+    def get_responses(
+        self, prompt, prompt_content
+    ) -> Tuple[PIResponse, ChatCompletion]:
+        prompt_size = len(json.dumps(prompt))
+        if prompt_size > self.config.max_prompt_length * 5:
+            raise ValueError(
+                f"The prompt template is too long ({prompt_size} chars). Please reduce the "
+                f"number of columns or increase the max_prompt_length."
+            )
+        comment_response, message_payload = self.get_pi_response(
+            self.config,
+            content=prompt_content,
+            prompt_content=prompt[self.config.mode],
+            model=self.config.model,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+        )
+        return comment_response, message_payload
+
+    def predict_chat_response(self, prompt_content):
+        try:
+            self.chat_response = self.chat_client.create_structured_completion(
+                messages=prompt_content,
+                response_model=PIResponse,
+                model=self.config.model,
+                max_tokens=self.config.max_tokens,
+                temperature=self.config.temperature,
+            )
+            return self.chat_response
+        except Exception as e:
+            print(f"Validation error - response: {e}")
+            raise e
+
+    def get_pi_response(
+        self,
+        config: MetadataConfig,
+        content: str,
+        prompt_content: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        retries: int = 0,
+        max_retries: int = 5,
+    ) -> Tuple[PIResponse, Dict[str, Any]]:
+        try:
+            chat_response = self._get_chat_completion(
+                config, prompt_content, model, max_tokens, temperature
+            )
+            response_payload = None
+            return chat_response, response_payload
+        except (ValidationError, json.JSONDecodeError, AttributeError) as e:
+            if retries < max_retries:
+                return self.get_pi_response(
+                    config,
+                    content,
+                    prompt_content,
+                    model,
+                    max_tokens,
+                    temperature,
+                    retries + 1,
+                    max_retries,
+                )
+            else:
+                raise ValueError(
+                    f"Validation error after {max_retries} attempts: {e}"
+                )
+
+    def _get_chat_completion(
+        self,
+        config: MetadataConfig,
+        prompt_content: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        retries: int = 0,
+        max_retries: int = 3,
+    ) -> ChatCompletion:
+        try:
+            return self.predict_chat_response(prompt_content)
+        except Exception as e:
+            if retries < max_retries:
+                logger.warning("[PI RETRY] Error: %s. Retrying in %ds...", e, 2 ** retries)
+                exponential_backoff(retries)
+                return self._get_chat_completion(
+                    config,
+                    prompt_content,
+                    model,
+                    max_tokens,
+                    temperature,
+                    retries + 1,
+                    max_retries,
+                )
+            else:
+                raise e
+
+    def _parse_response(self, response: str) -> Dict[str, Any]:
+        try:
+            response_dict = json.loads(response)
+            if not isinstance(response_dict, dict):
+                raise ValueError("Response is not a valid dict")
+            return response_dict
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON decode error: {e}")
+
+    def _validate_response(self, content: str, response_dict: Dict[str, Any]) -> None:
+        if not self._check_list_and_dict_keys_match(
+            content["column_contents"]["columns"], response_dict["columns"]
+        ):
+            raise ValueError("Column names do not match column contents")
+
+    @staticmethod
+    def _check_list_and_dict_keys_match(dict_list, string_list):
+        if isinstance(dict_list, list):
+            dict_keys = dict_list
+        else:
+            try:
+                dict_keys = dict_list.keys()
+            except Exception:
+                raise TypeError("dict_list is not a list or a dictionary")
+        list_matches_keys = all(item in dict_keys for item in string_list)
+        keys_match_list = all(key in string_list for key in dict_keys)
+        if not (list_matches_keys and keys_match_list):
+            return False
+        return True
+
+
+class MetadataGeneratorFactory:
+    @staticmethod
+    def create_generator(config) -> MetadataGenerator:
+        if config.mode == "comment":
+            generator = CommentGenerator()
+            generator.from_context(config)
+            return generator
+        elif config.mode == "pi":
+            generator = PIIdentifier()
+            generator.from_context(config)
+            return generator
+        else:
+            raise ValueError("Invalid mode. Use 'pi' or 'comment'.")

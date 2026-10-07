@@ -1,0 +1,50 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: check-docstring-first
+
+  - repo: local
+    hooks:
+      - id: rebuild-frontend
+        name: Rebuild frontend
+        language: system
+        entry: bash -c 'cd apps/dbxmetagen-app/app/src && npm install --silent && npm run build && cd ../../../.. && git add apps/dbxmetagen-app/app/src/dist/'
+        files: ^apps/dbxmetagen-app/app/src/(?!dist/)
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # uv.lock is intentionally gitignored: on Databricks-internal machines
+      # `uv lock` bakes the internal PyPI proxy URL into the lockfile, which
+      # breaks public customers who cannot reach the proxy (the 0.10.x main
+      # regression). requirements.txt is the committed pin instead. This hook
+      # blocks the lockfile from ever being force-added back into the repo.
+      - id: reject-uv-lock
+        name: Reject committing uv.lock (must stay gitignored)
+        language: fail
+        entry: "uv.lock must not be committed -- it is gitignored to keep internal PyPI proxy URLs out of the public repo. Unstage it: git rm --cached uv.lock (see CLAUDE.md Build & Test Commands)."
+        files: ^uv\.lock$
+        stages: [pre-commit]
+
+      - id: sync-requirements
+        name: Sync requirements.txt from uv.lock
+        language: system
+        entry: bash -c 'if [ ! -f uv.lock ]; then echo "No local uv.lock; commit requirements.txt manually after uv lock + export"; exit 0; fi; bash scripts/export_requirements.sh && git add requirements.txt'
+        files: ^pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: pure-logic-tests
+        name: Pure logic tests
+        language: system
+        entry: bash -c 'uv run pytest tests/test_pure_logic.py -x -q'
+        files: ^src/dbxmetagen/
+        pass_filenames: false
+        stages: [pre-commit]

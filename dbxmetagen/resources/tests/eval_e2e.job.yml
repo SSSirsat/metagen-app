@@ -1,0 +1,81 @@
+resources:
+  jobs:
+    eval_e2e_job:
+      name: "${var.app_name}${var.app_name_suffix}_eval_e2e"
+      budget_policy_id: ${var.budget_policy_id}
+
+      permissions:
+        - service_principal_name: ${resources.apps.dbxmetagen_app.service_principal_client_id}
+          level: CAN_MANAGE_RUN
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      parameters:
+        - name: catalog_name
+          default: ${var.catalog_name}
+        - name: schema_name
+          default: investing_ops_test
+        - name: metadata_schema
+          default: investing_ops_metadata
+        - name: eval_schema
+          default: investing_ops_eval
+        - name: model_serving_endpoint
+          # Must match an endpoint available on the target workspace (FEVM: databricks-claude-sonnet-4-6)
+          default: databricks-claude-sonnet-4-6
+        - name: ontology_bundle
+          default: schema_org
+        - name: fred_secret_scope
+          default: ""
+        - name: skip_generation
+          default: "true"
+        - name: skip_pipeline
+          default: "false"
+        - name: skip_idempotency
+          default: "true"
+        - name: exclude_tables
+          default: ""
+        - name: federation_mode
+          default: "false"
+        - name: min_overall_score
+          default: "0.40"
+        - name: metagen_job_id
+          default: ${resources.jobs.metadata_generator_job.id}
+        - name: pipeline_job_id
+          default: ${resources.jobs.full_analytics_pipeline_job.id}
+
+      tasks:
+        - task_key: run_e2e_test
+          max_retries: 0
+          timeout_seconds: 14400
+          environment_key: default
+          notebook_task:
+            notebook_path: ../../tests/data/build_test_warehouse.py
+            base_parameters:
+              catalog_name: "{{job.parameters.catalog_name}}"
+              schema_name: "{{job.parameters.schema_name}}"
+              metadata_schema: "{{job.parameters.metadata_schema}}"
+              eval_schema: "{{job.parameters.eval_schema}}"
+              model_serving_endpoint: "{{job.parameters.model_serving_endpoint}}"
+              ontology_bundle: "{{job.parameters.ontology_bundle}}"
+              fred_secret_scope: "{{job.parameters.fred_secret_scope}}"
+              skip_generation: "{{job.parameters.skip_generation}}"
+              skip_pipeline: "{{job.parameters.skip_pipeline}}"
+              skip_idempotency: "{{job.parameters.skip_idempotency}}"
+              exclude_tables: "{{job.parameters.exclude_tables}}"
+              federation_mode: "{{job.parameters.federation_mode}}"
+              min_overall_score: "{{job.parameters.min_overall_score}}"
+              metagen_job_id: "{{job.parameters.metagen_job_id}}"
+              pipeline_job_id: "{{job.parameters.pipeline_job_id}}"
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../../dist/*.whl
+              - yfinance
+              - fredapi
+              - faker
+              - lxml

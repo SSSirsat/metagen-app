@@ -1,0 +1,422 @@
+"""Entry point to dbxmetagen generate metadata."""
+
+import logging
+import os
+from pyspark.sql import SparkSession
+from dbxmetagen.error_handling import validate_csv
+from dbxmetagen.processing import (
+    setup_ddl,
+    create_tables,
+    setup_queue,
+    upsert_table_names_to_control_table,
+    generate_and_persist_metadata,
+    get_control_table,
+    table_exists_uc,
+)
+from dbxmetagen.config import MetadataConfig
+from dbxmetagen.deterministic_pi import ensure_spacy_model
+from dbxmetagen.benchmarking import log_token_usage, setup_benchmarking
+from dbxmetagen.databricks_utils import (
+    grant_user_permissions,
+    grant_group_permissions,
+)
+
+_logger = logging.getLogger(__name__)
+
+
+def get_dbr_version():
+    """Get Databricks Runtime version from environment."""
+    dbr_version = os.environ.get("DATABRICKS_RUNTIME_VERSION", None)
+    if dbr_version:
+        print(f"Databricks Runtime Version: {dbr_version}")
+    else:
+        print("DATABRICKS_RUNTIME_VERSION environment variable not found.")
+    return dbr_version
+
+
+def validate_runtime_compatibility(dbr_version, config):
+    """Validate runtime compatibility with output formats."""
+    ddl_fmt = getattr(config, "ddl_output_format", "tsv")
+    review_fmt = getattr(config, "review_output_file_type", "tsv")
+    if not dbr_version:
+        return
+    if "client" in dbr_version and "excel" in (ddl_fmt, review_fmt):
+        raise ValueError(
+            "Serverless runtime is supported, but Excel writes are not supported."
+        )
+
+    if "ml" not in dbr_version and "excel" in (ddl_fmt, review_fmt):
+        raise ValueError(
+            "Excel writes in dbxmetagen are not supported on standard runtimes. "
+            "Please change your output file type to tsv or sql if appropriate."
+        )
+
+
+def setup_mode_dependencies(config):
+    """Setup mode-specific dependencies and validate configurations."""
+    if config.mode == "pi":
+        if config.include_deterministic_pi:
+            ensure_spacy_model(config.spacy_model_names)
+
+    elif config.mode == "domain":
+        if not os.path.exists(config.domain_config_path):
+            _logger.warning("Domain config not found at %s, using fallback", config.domain_config_path)
+
+    elif config.mode == "comment":
+        pass
+
+    else:
+        raise ValueError(
+            f"Invalid mode: {config.mode}. Must be 'comment', 'pi', or 'domain'."
+        )
+
+
+def setup_environment(config):
+    """Setup Databricks environment variables."""
+    if not os.environ.get("DATABRICKS_HOST") and config.base_url:
+        os.environ["DATABRICKS_HOST"] = config.base_url
+
+
+def seed_customer_context(config):
+    """Seed the customer_context table from a YAML dir before generation.
+
+    Enables customer-context enrichment on the pip-install / notebook path (no
+    app UI): pass use_customer_context=true AND customer_context_yaml_dir=<dir>
+    to main(). The dir holds one or more *.yaml files with a top-level
+    `contexts:` list of {scope, scope_type, context_text, [context_label,
+    priority]} entries (scope_type in catalog|schema|table|pattern). Seeding is
+    a MERGE keyed on scope, so re-runs are idempotent. No-op unless BOTH the
+    flag and the dir are set, so existing runs are unaffected.
+    """
+    if not getattr(config, "use_customer_context", False):
+        return
+    yaml_dir = getattr(config, "customer_context_yaml_dir", "") or ""
+    if not yaml_dir:
+        return
+    # Optional enrichment: a bad YAML dir or a transient seed failure must NOT abort
+    # core metadata generation (same non-fatal treatment as grant_permissions_*).
+    try:
+        from pyspark.sql import SparkSession
+        from dbxmetagen.customer_context import seed_customer_context_table
+
+        spark = SparkSession.builder.getOrCreate()
+        n = seed_customer_context_table(
+            spark, config.catalog_name, config.schema_name, yaml_dir
+        )
+        print(f"Seeded {n} customer context entries from {yaml_dir}")
+    except Exception as e:
+        _logger.warning("Customer-context seeding failed (non-fatal): %s", e)
+        print(f"WARNING: customer-context seeding from {yaml_dir} failed ({e}); "
+              "continuing without it.")
+
+
+def initialize_infrastructure(config):
+    """Initialize DDL directories, tables, and queue."""
+    setup_ddl(config)
+    create_tables(config)
+    seed_customer_context(config)
+    config.table_names = setup_queue(config)
+    if config.control_table:
+        upsert_table_names_to_control_table(config.table_names, config)
+    print("Running generate on...", config.table_names)
+
+
+def _grant_permissions_to_groups(config, catalog_name, schema_name, volume_name):
+    """Grant permissions to groups specified in config."""
+    if not hasattr(config, "permission_groups") or not config.permission_groups:
+        return False
+
+    if str(config.permission_groups).lower() == "none":
+        return True
+
+    groups = [g.strip() for g in str(config.permission_groups).split(",") if g.strip()]
+    any_granted = False
+    for group in groups:
+        granted = grant_group_permissions(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            group_name=group,
+            volume_name=volume_name,
+        )
+        if granted:
+            print(f"Granted permissions to group: {group}")
+            any_granted = True
+    return any_granted
+
+
+def _grant_permissions_to_users(config, catalog_name, schema_name, volume_name):
+    """Grant permissions to additional users specified in config."""
+    if not hasattr(config, "permission_users") or not config.permission_users:
+        return False
+
+    if str(config.permission_users).lower() == "none":
+        return True
+
+    users = [u.strip() for u in str(config.permission_users).split(",") if u.strip()]
+    any_granted = False
+    for user in users:
+        granted = grant_user_permissions(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            current_user=user,
+            volume_name=volume_name,
+        )
+        if granted:
+            print(f"Granted permissions to user: {user}")
+            any_granted = True
+    return any_granted
+
+
+def grant_permissions_on_created_objects(config):
+    """Grant permissions to groups and users specified in config.
+
+    This function attempts to grant permissions but failures are non-fatal.
+    Permission grants can fail if the user/service principal doesn't have
+    admin privileges, which is common and expected in many deployments.
+    """
+    if not getattr(config, "grant_permissions_after_creation", True):
+        print(
+            "Permission grants disabled in config (grant_permissions_after_creation=false)"
+        )
+        return
+
+    catalog_name = config.catalog_name
+    schema_name = config.schema_name
+    volume_name = config.volume_name
+
+    try:
+        # Try to grant permissions - will be skipped if user lacks MANAGE
+        job_user_granted = grant_user_permissions(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            current_user=config.current_user,
+            volume_name=volume_name,
+        )
+        
+        groups_granted = _grant_permissions_to_groups(
+            config, catalog_name, schema_name, volume_name
+        )
+        users_granted = _grant_permissions_to_users(
+            config, catalog_name, schema_name, volume_name
+        )
+        
+        # Print summary message
+        if job_user_granted or groups_granted or users_granted:
+            print("Permission grants completed successfully")
+        else:
+            print("Skipped permission grants - current user lacks MANAGE on schema")
+
+        if not groups_granted and not users_granted:
+            print("No additional groups or users specified for permissions")
+
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("[WARNING] PERMISSION GRANT WARNING (NON-FATAL)")
+        print("=" * 80)
+        print(f"Could not grant some permissions: {e}")
+        print("\nWhy this happens:")
+        print("  - The job user/service principal may not have admin privileges")
+        print("  - This is common and expected in production environments")
+        print("\nWhy it's OK:")
+        print("  - Metadata generation completed successfully")
+        print("  - Generated metadata is available in the output catalog/schema")
+        print("  - You can manually grant permissions if needed")
+        print("\nTo disable these grant attempts:")
+        print("  - Set 'grant_permissions_after_creation: false' in variables.yml")
+        print("  - Or pass grant_permissions_after_creation=false to the job")
+        print("\nTo manually grant permissions, run:")
+        print(
+            f"  GRANT USE SCHEMA ON SCHEMA {catalog_name}.{schema_name} TO `<user_or_group>`;"
+        )
+        print(
+            f"  GRANT SELECT ON SCHEMA {catalog_name}.{schema_name} TO `<user_or_group>`;"
+        )
+        if volume_name:
+            print(
+                f"  GRANT READ VOLUME ON VOLUME {catalog_name}.{schema_name}.{volume_name} TO `<user_or_group>`;"
+            )
+        print("=" * 80 + "\n")
+
+
+def cleanup_resources(config, spark):
+    """Cleanup temporary tables and control tables."""
+    temp_table = config.get_temp_metadata_log_table_name()
+    control_table = get_control_table(config)
+    control_table_full = f"{config.catalog_name}.{config.schema_name}.{control_table}"
+
+    # Clean up temp table
+    try:
+        spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
+        print(f"Cleaned up temp table: {temp_table}")
+    except Exception as e:
+        print(f"Temp table cleanup failed: {e}")
+
+    # Clean up control table
+    mode = config.mode or "comment"
+    mode_filter = f"AND (_mode = '{mode}' OR _mode IS NULL)"
+    try:
+        if (
+            config.cleanup_control_table == "true"
+            or config.cleanup_control_table == True
+        ):
+            if config.run_id is not None:
+                # Selective cleanup based on status
+                # By default, only delete completed entries (keep failed for retry)
+                cleanup_failed = getattr(config, 'cleanup_failed_tables', False)
+                
+                if cleanup_failed:
+                    # Delete all entries for this run/mode (completed AND failed)
+                    # DELETE: Control table rows matching _run_id + pipeline mode filter (scope includes NULL _mode via OR).
+                    # WHY: Tear down all claim/lease state after a run when operators want a clean slate including failed
+                    # tables (e.g. dev reset) so the next job does not see stale failed rows.
+                    # TRADEOFFS: Broad predicate is simple versus targeted MERGE; string-interpolated run_id trusts config
+                    # hygiene (no SQL injection from trusted job args); removes retry hints for failed tables.
+                    spark.sql(
+                        f"DELETE FROM {control_table_full} WHERE _run_id = '{config.run_id}' {mode_filter}"
+                    )
+                    print(
+                        f"Cleaned up all control table rows for run_id {config.run_id} mode {mode}: {control_table_full}"
+                    )
+                else:
+                    # Only delete completed entries, keep failed for potential retry
+                    # DELETE: Subset of control rows for this _run_id where _status='completed', still scoped by mode filter.
+                    # WHY: Default post-run hygiene removes successful claims while retaining failed rows so operators or
+                    # automatic retries can inspect/re-queue failures without losing diagnostic state.
+                    # TRADEOFFS: Leaves failed + in_progress edge cases untouched (only 'completed'); simpler than archive
+                    # tables; same interpolated-id considerations as other DELETE paths.
+                    spark.sql(
+                        f"DELETE FROM {control_table_full} WHERE _run_id = '{config.run_id}' AND _status = 'completed' {mode_filter}"
+                    )
+                    print(
+                        f"Cleaned up completed control table rows for run_id {config.run_id} mode {mode}: {control_table_full}"
+                    )
+                    # Log if there are failed entries remaining
+                    failed_count = spark.sql(
+                        f"SELECT COUNT(*) as cnt FROM {control_table_full} WHERE _run_id = '{config.run_id}' AND _status = 'failed' {mode_filter}"
+                    ).first().cnt
+                    if failed_count > 0:
+                        print(f"Note: {failed_count} failed table(s) retained for potential retry")
+            elif config.job_id is not None:
+                # Fallback to job_id for backward compatibility
+                # DELETE: Control rows keyed by legacy _job_id instead of run_id, with identical mode scoping filter.
+                # WHY: Supports older deployments/notebooks that never populated run_id but still need deterministic
+                # cleanup after job completion.
+                # TRADEOFFS: job_id may be less unique across reruns than run_id (collision risk if reused); broad delete
+                # clears all modes' rows for that id unless mode_filter narrows—mirrors historical behavior.
+                spark.sql(
+                    f"DELETE FROM {control_table_full} WHERE _job_id = '{config.job_id}' {mode_filter}"
+                )
+                print(
+                    f"Cleaned up control table rows for job_id {config.job_id} mode {mode}: {control_table_full}"
+                )
+            else:
+                spark.sql(f"DROP TABLE IF EXISTS {control_table_full}")
+                print(f"Dropped control table: {control_table_full}")
+    except Exception as e:
+        print(f"Control table cleanup skipped (table may not exist): {e}")
+
+
+def main(kwargs):
+    """Main function to generate metadata."""
+    # Initialize Spark and get runtime info
+    spark = SparkSession.builder.getOrCreate()
+    dbr_version = get_dbr_version()
+
+    # Validate required parameters early
+    catalog_name = kwargs.get("catalog_name", "")
+    table_names = kwargs.get("table_names", "")
+
+    if not catalog_name or str(catalog_name).lower() in ["none", "null", ""]:
+        raise ValueError(
+            "REQUIRED PARAMETER MISSING: catalog_name\n\n"
+            "Please provide a valid catalog name.\n"
+            "The catalog name cannot be 'none', 'null', or empty.\n\n"
+            "Set it via:\n"
+            "  - Notebook widget: 'Catalog Name (required)'\n"
+            "  - Job parameter: catalog_name\n"
+            "  - variables.yml: catalog_name.default\n\n"
+            "Example: my_catalog"
+        )
+
+    if not table_names or str(table_names).lower() in ["none", "null", ""]:
+        raise ValueError(
+            "REQUIRED PARAMETER MISSING: table_names\n\n"
+            "Please provide table names to process.\n"
+            "Specify one or more tables in the format: catalog.schema.table\n\n"
+            "Set it via:\n"
+            "  - Notebook widget: 'Table Names - comma-separated (required)'\n"
+            "  - Job parameter: table_names\n\n"
+            "Examples:\n"
+            "  - Single table: my_catalog.my_schema.my_table\n"
+            "  - Multiple tables: my_catalog.schema1.table1, my_catalog.schema2.table2"
+        )
+
+    # Initialize configuration and benchmarking
+    config = MetadataConfig(**kwargs)
+
+    # Fail fast if apply_ddl=true with concurrent mode execution
+    if config.apply_ddl and config.task_id:
+        raise ValueError(
+            "apply_ddl=true is not supported with concurrent task execution. "
+            "When running multiple modes in parallel on the same tables, "
+            "set apply_ddl=false. Apply DDL separately after reviewing results."
+        )
+
+    if config.incremental:
+        log_table = f"{config.catalog_name}.{config.schema_name}.metadata_generation_log"
+        if not table_exists_uc(spark, log_table):
+            _logger.warning(
+                "incremental=true but %s does not exist (first run?). "
+                "Disabling incremental mode -- all tables will be processed.",
+                log_table,
+            )
+            print(
+                f"WARNING: incremental mode disabled -- {log_table} not found. "
+                "This is expected on the first run. Re-enable incremental for subsequent runs."
+            )
+            config.incremental = False
+
+    benchmarking_result = setup_benchmarking(config)
+    experiment_name, run_start_time_ms = benchmarking_result if benchmarking_result else (None, 0)
+
+    # Validate override CSV (only if manual overrides are enabled)
+    if getattr(config, "allow_manual_override", True):
+        override_path = (
+            config.override_csv_path
+            if hasattr(config, "override_csv_path")
+            else "metadata_overrides.csv"
+        )
+        # Only validate if file exists (it's optional)
+        if os.path.exists(override_path):
+            if not validate_csv(override_path):
+                raise ValueError(
+                    f"Invalid {override_path} file. Please check the format of "
+                    "your metadata_overrides configuration file."
+                )
+
+    # Validate runtime compatibility
+    validate_runtime_compatibility(dbr_version, config)
+
+    # Setup mode-specific dependencies
+    setup_mode_dependencies(config)
+
+    # Use try/finally to ensure cleanup runs even on errors
+    # The finally block ensures temp tables are cleaned up, but exceptions still propagate
+    try:
+        # Setup environment and infrastructure
+        setup_environment(config)
+        initialize_infrastructure(config)
+
+        # Generate metadata
+        generate_and_persist_metadata(config)
+
+        # Grant permissions on created objects
+        grant_permissions_on_created_objects(config)
+
+        # Log token usage if benchmarking is enabled
+        if experiment_name:
+            log_token_usage(config, experiment_name, run_start_time_ms)
+    finally:
+        # Always cleanup resources, even if there were errors above
+        # cleanup_resources has internal error handling to prevent masking original exceptions
+        cleanup_resources(config, spark)

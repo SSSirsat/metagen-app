@@ -1,0 +1,82 @@
+[project]
+name = "dbxmetagen"
+version = "0.10.71"
+description = "Generates comments and identifies and classifies other metadata for Delta tables in Databricks."
+readme = "README.md"
+authors = [{ name = "Eli Swanson", email = "eli.swanson@databricks.com" }]
+license = { text = "DB License" }
+requires-python = ">=3.10.12,<3.14.0"
+dependencies = [
+    "mlflow==3.11.1",
+    # Range, not a hard pin: a bare `==` forces pip to DOWNGRADE the runtime's openai
+    # (DBR/serverless ship newer), which then trips the runtime's own langchain-openai/
+    # litellm resolver checks (neither is a dbxmetagen dependency). A range lets pip keep
+    # whatever openai the runtime already has, so no downgrade + no scary conflict warning.
+    # Our openai usage (OpenAI(), chat.completions.create, response types) is stable on 1.x.
+    "openai>=1.56.1,<2",
+    "cloudpickle>=3.1.0,<4",
+    "pydantic==2.10.3",
+    # NOTE: ydata-profiling is intentionally NOT a dependency. profiling.py is fully
+    # Spark-native (APPROX_COUNT_DISTINCT / PERCENTILE_APPROX / DESCRIBE DETAIL); ydata
+    # was declared historically but never imported. It dragged the numba/llvmlite/
+    # statsmodels stack into cold serverless env builds and conflicted with classic ML
+    # runtimes. Do not re-add it unless code actually imports it.
+    "databricks-langchain==0.4.0",
+    "databricks-sdk==0.68.0",
+    "openpyxl==3.1.5",
+    # Loosened from == to >= to align with the serverless base env and cut cold-build
+    # churn (pip keeps the base version instead of reinstalling). deprecated>=1.2.18 in
+    # base also clears the deltalake conflict warning.
+    "deprecated>=1.2.13,<2",
+    "pyyaml>=6.0.1,<7",
+    "requests>=2.32,<3",
+    "nest-asyncio>=1.6.0,<2",
+    # anyio is intentionally NOT pinned -- it is a transitive hub (httpx/starlette/
+    # fastapi/openai/langchain all depend on it) and the Databricks serverless and
+    # ML-runtime bases already ship a compatible anyio (4.x), so leaving it unpinned
+    # lets pip keep the base version instead of forcing a churny reinstall. An earlier
+    # anyio>=3.7,<4 pin (issue #218) was a misdiagnosis: the cold serverless build
+    # failure it targeted was actually caused by the (now-removed) ydata-profiling
+    # dependency's heavy install, not by anyio version walking.
+    "databricks-vectorsearch==0.66",
+    # networkx: used (guarded) by notebooks/final_analysis.py for the similarity-graph
+    # plot. It was previously satisfied ONLY transitively via ydata-profiling; declared
+    # directly here so removing ydata doesn't silently drop the analytics-pipeline graph
+    # viz. Pure-Python and light -- does not reintroduce the numba/statsmodels weight.
+    "networkx>=2.8,<4",
+]
+
+[project.optional-dependencies]
+pi = ["spacy==3.8.7", "presidio-analyzer==2.2.358"]
+pi-lg = ["spacy==3.8.7", "presidio-analyzer==2.2.358"]
+ontology = ["rdflib>=6.3.0", "pyoxigraph>=0.3.0"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0.1,<5",
+    "pytest>=8.3.4",
+    "rdflib>=6.3.0",
+    "hypothesis>=6.100.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dbxmetagen"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--ignore=notebooks/integration_tests --ignore=tests/test_app_logic.py"
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "app: marks tests as legacy app tests (run separately due to mocking)",
+]

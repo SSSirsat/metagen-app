@@ -1,0 +1,39 @@
+resources:
+  jobs:
+    sync_graph_lakebase_job:
+      name: "${var.app_name}${var.app_name_suffix}_sync_graph_lakebase"
+
+      permissions:
+        - service_principal_name: ${resources.apps.dbxmetagen_app.service_principal_client_id}
+          level: CAN_MANAGE_RUN
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      parameters:
+        - name: catalog_name
+          default: ${var.catalog_name}
+        - name: schema_name
+          default: ${var.schema_name}
+        - name: lakebase_catalog
+          default: ${var.lakebase_catalog}
+        - name: lakebase_instance_name
+          default: ${var.lakebase_instance_name}
+
+      job_clusters:
+        - job_cluster_key: lakebase_cluster
+          new_cluster: ${var.lakebase_job_cluster}
+      tasks:
+        - task_key: sync_to_lakebase
+          job_cluster_key: lakebase_cluster
+          max_retries: 1
+          min_retry_interval_millis: 600000
+          timeout_seconds: 14400
+          notebook_task:
+            notebook_path: ../../notebooks/sync_graph_to_lakebase.py
+            base_parameters:
+              source_catalog: "{{job.parameters.catalog_name}}"
+              source_schema: "{{job.parameters.schema_name}}"
+              lakebase_catalog: "{{job.parameters.lakebase_catalog}}"
+              lakebase_instance_name: "{{job.parameters.lakebase_instance_name}}"

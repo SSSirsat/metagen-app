@@ -1,0 +1,4464 @@
+"""Unit tests for ontology module."""
+
+import inspect
+import json
+import os
+import tempfile
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from pyspark.sql import SparkSession
+
+from dbxmetagen.ontology import (
+    OntologyConfig,
+    OntologyLoader,
+    EntityDefinition,
+    EntityDiscoverer,
+    EntityClassificationResult,
+    OntologyBuilder,
+    EdgeCatalog,
+    EdgeCatalogEntry,
+    PropertyDefinition,
+    build_ontology,
+    _enforce_entity_value,
+    _resolve_ontology_config_path,
+    _resolve_tier_dir,
+    _DEFAULT_ONTOLOGY_CONFIG_PATH,
+    DEFAULT_CLASSIFICATION_MODEL,
+    DOMAIN_ENTITY_AFFINITY,
+)
+
+
+class TestOntologyConfig:
+    """Tests for OntologyConfig."""
+    
+    def test_fully_qualified_entities(self):
+        config = OntologyConfig(
+            catalog_name="test_catalog",
+            schema_name="test_schema"
+        )
+        assert config.fully_qualified_entities == "test_catalog.test_schema.ontology_entities"
+    
+    def test_fully_qualified_metrics(self):
+        config = OntologyConfig(
+            catalog_name="test_catalog",
+            schema_name="test_schema"
+        )
+        assert config.fully_qualified_metrics == "test_catalog.test_schema.ontology_metrics"
+    
+    def test_fully_qualified_kb(self):
+        config = OntologyConfig(
+            catalog_name="test_catalog",
+            schema_name="test_schema"
+        )
+        assert config.fully_qualified_kb == "test_catalog.test_schema.table_knowledge_base"
+
+
+class TestOntologyLoader:
+    """Tests for OntologyLoader."""
+    
+    def test_default_config(self):
+        config = OntologyLoader._default_config()
+        assert "version" in config
+        assert "entities" in config
+        assert "relationships" in config
+    
+    def test_default_config_has_auto_discover(self):
+        config = OntologyLoader._default_config()
+        assert config["entities"]["auto_discover"] is True
+    
+    def test_default_config_has_lowered_threshold(self):
+        """Default threshold should be 0.4 (lowered from 0.7)."""
+        config = OntologyLoader._default_config()
+        assert config["entities"]["discovery_confidence_threshold"] == 0.4
+    
+    def test_default_config_has_embedded_definitions(self):
+        """Default config should include embedded entity definitions."""
+        config = OntologyLoader._default_config()
+        definitions = config["entities"]["definitions"]
+        assert len(definitions) > 0
+        assert "Person" in definitions
+        assert "Product" in definitions
+        assert "DataTable" in definitions  # Fallback type
+    
+    def test_get_entity_definitions_uses_defaults_when_empty(self):
+        """When config has empty definitions, should use embedded defaults."""
+        config = {"entities": {"definitions": {}}}
+        entities = OntologyLoader.get_entity_definitions(config)
+        # Should NOT be empty - should use embedded defaults
+        assert len(entities) > 0
+    
+    def test_get_entity_definitions_with_data(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Customer": {
+                        "description": "Customer entity",
+                        "keywords": ["customer", "user"],
+                        "typical_attributes": ["id", "name"]
+                    }
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        assert len(entities) == 1
+        assert entities[0].name == "Customer"
+        assert entities[0].description == "Customer entity"
+        assert "customer" in entities[0].keywords
+    
+    def test_get_entity_definitions_multiple(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Customer": {"description": "Customer", "keywords": ["customer"]},
+                    "Product": {"description": "Product", "keywords": ["product"]},
+                    "Patient": {"description": "Patient", "keywords": ["patient"]}
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        assert len(entities) == 3
+        entity_names = [e.name for e in entities]
+        assert "Customer" in entity_names
+        assert "Product" in entity_names
+        assert "Patient" in entity_names
+
+
+class TestEntityDefinition:
+    """Tests for EntityDefinition."""
+    
+    def test_creation(self):
+        entity = EntityDefinition(
+            name="Customer",
+            description="A customer",
+            keywords=["customer"],
+            typical_attributes=["id"]
+        )
+        assert entity.name == "Customer"
+        assert entity.description == "A customer"
+    
+    def test_default_lists(self):
+        entity = EntityDefinition(name="Test", description="Test")
+        assert entity.keywords == []
+        assert entity.typical_attributes == []
+    
+    def test_keywords_are_list(self):
+        entity = EntityDefinition(
+            name="Test",
+            description="Test",
+            keywords=["a", "b", "c"]
+        )
+        assert isinstance(entity.keywords, list)
+        assert len(entity.keywords) == 3
+
+
+class TestEntityDiscoverer:
+    """Tests for EntityDiscoverer."""
+    
+    @pytest.fixture
+    def mock_spark(self):
+        return MagicMock()
+    
+    @pytest.fixture
+    def config(self):
+        return OntologyConfig(
+            catalog_name="test_catalog",
+            schema_name="test_schema"
+        )
+    
+    def test_calculate_match_confidence_exact_match(self):
+        ontology_config = {
+            "entities": {
+                "discovery_confidence_threshold": 0.5,
+                "definitions": {}
+            }
+        }
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        entity_def = EntityDefinition(
+            name="Customer",
+            description="Customer entity",
+            keywords=["customer", "user"],
+            typical_attributes=["customer_id", "name"]
+        )
+        
+        # New API: name_variations, original_name, comment, entity_def
+        name_variations = discoverer._normalize_name("customer_master")
+        confidence = discoverer._calculate_match_confidence(
+            name_variations,
+            "customer_master",
+            "this table contains customer data with customer_id and name",
+            entity_def
+        )
+        assert confidence > 0.4
+    
+    def test_calculate_match_confidence_no_match(self):
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        entity_def = EntityDefinition(
+            name="Customer",
+            description="Customer entity",
+            keywords=["customer", "user"],
+            typical_attributes=["id", "name"]
+        )
+        
+        name_variations = discoverer._normalize_name("inventory_table")
+        confidence = discoverer._calculate_match_confidence(
+            name_variations,
+            "inventory_table",
+            "this table contains product inventory data",
+            entity_def
+        )
+        assert confidence < 0.3
+    
+    def test_calculate_match_confidence_partial_match(self):
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        entity_def = EntityDefinition(
+            name="Product",
+            description="Product entity",
+            keywords=["product", "item", "sku"],
+            typical_attributes=["id", "name", "price"]
+        )
+        
+        # Table name doesn't match but comment has "product"
+        name_variations = discoverer._normalize_name("inventory_items")
+        confidence = discoverer._calculate_match_confidence(
+            name_variations,
+            "inventory_items",
+            "this table stores product data",
+            entity_def
+        )
+        # Should have some confidence but not full
+        assert 0 < confidence < 1.0
+    
+    def test_default_classification_model(self):
+        """Default classification model should be claude-sonnet-4-6."""
+        assert DEFAULT_CLASSIFICATION_MODEL == "databricks-claude-sonnet-4-6"
+
+    def test_model_endpoint_from_config(self):
+        """Discoverer should read classification_model from validation config."""
+        ontology_config = {
+            "entities": {"definitions": {}},
+            "validation": {"classification_model": "my-custom-model"},
+        }
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        assert discoverer._model_endpoint == "my-custom-model"
+
+    def test_model_endpoint_default(self):
+        """Discoverer should fall back to DEFAULT_CLASSIFICATION_MODEL."""
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        assert discoverer._model_endpoint == DEFAULT_CLASSIFICATION_MODEL
+
+    def test_normalize_name_handles_snake_case(self):
+        """_normalize_name should handle snake_case variations."""
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        variations = discoverer._normalize_name("customer_orders")
+        assert "customer_orders" in variations
+        assert "customer orders" in variations
+        assert "customerorders" in variations
+    
+    def test_normalize_name_handles_plurals(self):
+        """_normalize_name should generate singular/plural variations."""
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        variations = discoverer._normalize_name("customers")
+        assert "customers" in variations
+        assert "customer" in variations  # Singular
+    
+    def test_normalize_name_empty_string(self):
+        """_normalize_name should handle empty strings."""
+        ontology_config = {"entities": {"definitions": {}}}
+        discoverer = EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+        
+        variations = discoverer._normalize_name("")
+        assert variations == []
+
+
+class TestOntologyBuilder:
+    """Tests for OntologyBuilder."""
+    
+    @pytest.fixture
+    def mock_spark(self):
+        return MagicMock()
+    
+    @pytest.fixture
+    def config(self):
+        return OntologyConfig(
+            catalog_name="test_catalog",
+            schema_name="test_schema"
+        )
+    
+    @pytest.fixture
+    def builder(self, mock_spark, config):
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            return OntologyBuilder(mock_spark, config)
+    
+    def test_create_entities_table(self, builder, mock_spark):
+        mock_spark.table.return_value.schema.fields = []
+        builder.create_entities_table()
+        mock_spark.sql.assert_called()
+        all_sql = [c[0][0] for c in mock_spark.sql.call_args_list]
+        ddl = all_sql[0]
+        assert "ontology_entities" in ddl
+        assert "CREATE TABLE IF NOT EXISTS" in ddl
+
+    def test_create_entities_table_has_required_columns(self, builder, mock_spark):
+        mock_spark.table.return_value.schema.fields = []
+        builder.create_entities_table()
+        ddl = mock_spark.sql.call_args_list[0][0][0]
+        assert "entity_id" in ddl
+        assert "entity_name" in ddl
+        assert "entity_type" in ddl
+        assert "confidence" in ddl
+        assert "auto_discovered" in ddl
+
+    def test_create_entities_table_runs_confidence_cleanup(self, builder, mock_spark):
+        mock_spark.table.return_value.schema.fields = []
+        builder.create_entities_table()
+        all_sql = [c[0][0] for c in mock_spark.sql.call_args_list]
+        cleanup_sqls = [s for s in all_sql if "GREATEST" in s and "LEAST" in s]
+        assert len(cleanup_sqls) == 1
+        assert "confidence < 0.0 OR confidence > 1.0" in cleanup_sqls[0]
+
+    def test_create_entities_table_cleanup_tolerates_failure(self, builder, mock_spark):
+        mock_spark.table.return_value.schema.fields = []
+
+        def side_effect(sql):
+            if "GREATEST" in sql:
+                raise Exception("table is empty")
+            return MagicMock()
+
+        mock_spark.sql.side_effect = side_effect
+        builder.create_entities_table()
+    
+    def test_create_metrics_table(self, builder, mock_spark):
+        builder.create_metrics_table()
+        mock_spark.sql.assert_called()
+        call_arg = mock_spark.sql.call_args[0][0]
+        assert "ontology_metrics" in call_arg
+    
+    def test_create_metrics_table_has_stub_columns(self, builder, mock_spark):
+        """Metrics table should have columns for future UC metric views."""
+        builder.create_metrics_table()
+        call_arg = mock_spark.sql.call_args[0][0]
+        assert "sql_definition" in call_arg
+        assert "uc_view_name" in call_arg
+
+
+class TestStoreEntitiesConfidenceClamping:
+    """Tests that _store_entities clamps confidence to [0, 1]."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def _extract_rows(self, builder):
+        return builder.spark.createDataFrame.call_args[0][0]
+
+    def test_negative_confidence_filtered_by_garbage_floor(self, builder):
+        entities = [{
+            "entity_id": "e1", "entity_type": "Patient",
+            "source_tables": ["t1"], "confidence": -0.5,
+        }]
+        result = builder._store_entities(entities)
+        assert result == 0  # filtered out by _MIN_STORE_CONFIDENCE
+        builder.spark.createDataFrame.assert_not_called()
+
+    def test_confidence_above_one_clamped(self, builder):
+        entities = [{
+            "entity_id": "e2", "entity_type": "Order",
+            "source_tables": ["t2"], "confidence": 1.5,
+        }]
+        builder._store_entities(entities)
+        rows = self._extract_rows(builder)
+        assert rows[0][7] == 1.0
+
+    def test_valid_confidence_unchanged(self, builder):
+        entities = [{
+            "entity_id": "e3", "entity_type": "Product",
+            "source_tables": ["t3"], "confidence": 0.75,
+        }]
+        builder._store_entities(entities)
+        rows = self._extract_rows(builder)
+        assert rows[0][7] == 0.75
+
+    def test_discovery_confidence_clamped(self, builder):
+        entities = [{
+            "entity_id": "e4", "entity_type": "Event",
+            "source_tables": ["t4"], "confidence": 0.8,
+            "discovery_confidence": -0.3,
+        }]
+        builder._store_entities(entities)
+        rows = self._extract_rows(builder)
+        assert rows[0][8] == 0.0  # discovery_confidence field
+
+
+class TestStoreEntitiesPrimitiveSuppression:
+    """Tests that _store_entities drops primitive datatype types as entities."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_primitive_datatype_entity_dropped(self, builder):
+        entities = [{
+            "entity_id": "e1", "entity_type": "Date",
+            "source_tables": ["t1"], "confidence": 0.95,
+        }]
+        result = builder._store_entities(entities)
+        assert result == 0
+        builder.spark.createDataFrame.assert_not_called()
+
+    def test_real_entity_retained(self, builder):
+        entities = [{
+            "entity_id": "e2", "entity_type": "Drug",
+            "source_tables": ["t2"], "confidence": 0.9,
+        }]
+        result = builder._store_entities(entities)
+        assert result == 1
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        assert rows[0][2] == "Drug"
+
+    def test_mixed_batch_drops_only_primitives(self, builder):
+        entities = [
+            {"entity_id": "e1", "entity_type": "Boolean",
+             "source_tables": ["t1"], "confidence": 0.99},
+            {"entity_id": "e2", "entity_type": "MedicalCondition",
+             "source_tables": ["t2"], "confidence": 0.8},
+            {"entity_id": "e3", "entity_type": "Integer",
+             "source_tables": ["t3"], "confidence": 0.95},
+        ]
+        result = builder._store_entities(entities)
+        assert result == 1
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        assert [r[2] for r in rows] == ["MedicalCondition"]
+
+    def test_primitive_matched_by_entity_name_fallback(self, builder):
+        entities = [{
+            "entity_id": "e1", "entity_name": "datetime",
+            "source_tables": ["t1"], "confidence": 0.9,
+        }]
+        result = builder._store_entities(entities)
+        assert result == 0
+        builder.spark.createDataFrame.assert_not_called()
+
+
+class TestBuildOntology:
+    """Tests for build_ontology function."""
+    
+    @patch('dbxmetagen.ontology.OntologyBuilder')
+    def test_creates_builder_with_correct_config(self, mock_builder_class):
+        mock_builder = MagicMock()
+        mock_builder.run.return_value = {"entities_discovered": 5, "entity_types": 3}
+        mock_builder_class.return_value = mock_builder
+        
+        mock_spark = MagicMock()
+        build_ontology(mock_spark, "my_cat", "my_sch")
+        
+        config = mock_builder_class.call_args[0][1]
+        assert config.catalog_name == "my_cat"
+        assert config.schema_name == "my_sch"
+    
+    @patch('dbxmetagen.ontology.OntologyBuilder')
+    def test_passes_config_path(self, mock_builder_class):
+        mock_builder = MagicMock()
+        mock_builder.run.return_value = {}
+        mock_builder_class.return_value = mock_builder
+        
+        build_ontology(MagicMock(), "cat", "sch", config_path="custom/path.yaml")
+        
+        config = mock_builder_class.call_args[0][1]
+        assert config.config_path == "custom/path.yaml"
+    
+    @patch('dbxmetagen.ontology.OntologyBuilder')
+    def test_returns_run_result(self, mock_builder_class):
+        expected = {"entities_discovered": 10, "entity_types": 4, "edges_added": 10}
+        mock_builder = MagicMock()
+        mock_builder.run.return_value = expected
+        mock_builder_class.return_value = mock_builder
+        
+        result = build_ontology(MagicMock(), "cat", "sch")
+        assert result == expected
+
+
+class TestEnforceEntityValue:
+    """Tests for _enforce_entity_value."""
+
+    def test_exact_match(self):
+        val, exact = _enforce_entity_value("Patient", ["Patient", "Provider"])
+        assert val == "Patient"
+        assert exact is True
+
+    def test_case_insensitive_match(self):
+        val, exact = _enforce_entity_value("patient", ["Patient", "Provider"])
+        assert val == "Patient"
+        assert exact is True
+
+    def test_partial_match(self):
+        val, exact = _enforce_entity_value("patient_record", ["Patient", "Provider"])
+        assert val == "Patient"
+        assert exact is False
+
+    def test_no_match_returns_fallback(self):
+        val, exact = _enforce_entity_value("xyz_unknown", ["Patient", "Provider"])
+        assert val == "DataTable"
+        assert exact is False
+
+    def test_custom_fallback(self):
+        val, exact = _enforce_entity_value("xyz", ["Patient"], fallback="Other")
+        assert val == "Other"
+
+
+class TestEntityClassificationResult:
+    """Tests for the Pydantic structured output model."""
+
+    def test_basic_creation(self):
+        r = EntityClassificationResult(
+            entity_type="Patient", confidence=0.9, reasoning="matches keywords"
+        )
+        assert r.entity_type == "Patient"
+        assert r.secondary_entity_type is None
+        assert r.recommended_entity is None
+
+    def test_multi_entity(self):
+        r = EntityClassificationResult(
+            entity_type="Patient",
+            secondary_entity_type="Encounter",
+            confidence=0.85,
+            reasoning="relationship table",
+        )
+        assert r.secondary_entity_type == "Encounter"
+
+    def test_recommended_entity(self):
+        r = EntityClassificationResult(
+            entity_type="DataTable",
+            confidence=0.3,
+            recommended_entity="ClinicalTrial",
+            reasoning="low confidence",
+        )
+        assert r.recommended_entity == "ClinicalTrial"
+
+
+class TestDomainEntityAffinity:
+    """Tests for the domain-to-entity affinity map."""
+
+    def test_healthcare_has_patient(self):
+        assert "Patient" in DOMAIN_ENTITY_AFFINITY["healthcare"]
+
+    def test_finance_has_transaction(self):
+        assert "Transaction" in DOMAIN_ENTITY_AFFINITY["finance"]
+
+
+class TestKeywordPrefilter:
+    """Tests for EntityDiscoverer._keyword_prefilter."""
+
+    def _make_discoverer(self):
+        ontology_config = OntologyLoader._default_config()
+        return EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+
+    def test_returns_candidates(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("patient_records", "medical records", "healthcare")
+        assert isinstance(result, list)
+        assert len(result) > 0
+
+    def test_domain_boosts_relevant(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("data_table", "", "healthcare", top_n=5)
+        healthcare_entities = DOMAIN_ENTITY_AFFINITY["healthcare"]
+        boosted = [r for r in result if r in healthcare_entities]
+        assert len(boosted) > 0
+
+    def test_top_n_limits_results(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("something", "", "unknown", top_n=3)
+        assert len(result) == 3
+
+
+class TestKeywordInText:
+    """Tests for EntityDiscoverer._keyword_in_text word-boundary matching."""
+
+    def test_pond_in_corresponding_rejected(self):
+        assert not EntityDiscoverer._keyword_in_text("pond", "the corresponding field")
+
+    def test_pond_in_pond_size_accepted(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "pond_size")
+
+    def test_pond_in_retention_pond_accepted(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "retention_pond")
+
+    def test_pond_standalone_accepted(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "the pond is large")
+
+    def test_short_keyword_rejected(self):
+        assert not EntityDiscoverer._keyword_in_text("day", "trading day flag")
+        assert not EntityDiscoverer._keyword_in_text("spa", "spa treatment")
+
+    def test_exact_short_word_with_custom_min_len(self):
+        assert EntityDiscoverer._keyword_in_text("day", "trading day", min_len=3)
+
+    def test_keyword_at_start_of_string(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "pond management system")
+
+    def test_keyword_at_end_of_string(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "fish pond")
+
+    def test_keyword_with_digits(self):
+        assert EntityDiscoverer._keyword_in_text("pond", "pond123 data")
+
+
+class TestColumnMatchScoreBoundary:
+    """Tests for _column_match_score word-boundary matching on keywords/attributes."""
+
+    @pytest.fixture
+    def discoverer(self):
+        return EntityDiscoverer(MagicMock(), MagicMock(), {"entities": {"definitions": {}}})
+
+    def test_pond_not_matched_in_corresponding(self, discoverer):
+        """Keyword 'pond' must NOT match 'corresponding' in column comments."""
+        entity_def = EntityDefinition(
+            name="Pond", description="A pond.",
+            keywords=["pond"], typical_attributes=[],
+        )
+        score = discoverer._column_match_score(
+            ["year"], "year",
+            "integer representation of the calendar year corresponding to the date",
+            "", entity_def,
+        )
+        assert score == 0.0
+
+    def test_pond_matched_as_standalone_word(self, discoverer):
+        entity_def = EntityDefinition(
+            name="Pond", description="A pond.",
+            keywords=["pond"], typical_attributes=[],
+        )
+        score = discoverer._column_match_score(
+            ["pond_depth"], "pond_depth",
+            "depth measurement of the pond", "", entity_def,
+        )
+        assert score > 0.0
+
+    def test_short_keyword_rejected_in_column(self, discoverer):
+        """Keywords shorter than 4 chars must not match at all."""
+        entity_def = EntityDefinition(
+            name="DaySpa", description="A day spa.",
+            keywords=["day", "spa"], typical_attributes=[],
+        )
+        score = discoverer._column_match_score(
+            ["day_of_week"], "day_of_week",
+            "day of the week as integer for spa scheduling", "", entity_def,
+        )
+        assert score == 0.0
+
+    def test_attribute_substring_rejected(self, discoverer):
+        """Typical attribute 'rate' must not match inside 'corporate'."""
+        entity_def = EntityDefinition(
+            name="LoanRate", description="Loan rate.",
+            keywords=[], typical_attributes=["rate"],
+        )
+        score = discoverer._column_match_score(
+            ["corporate_id"], "corporate_id",
+            "corporate identifier", "", entity_def,
+        )
+        assert score == 0.0
+
+
+class TestDeduplicateEntities:
+    """Tests for EntityDiscoverer.deduplicate_entities."""
+
+    def test_merges_same_table_entity(self):
+        entities = [
+            {
+                "entity_id": "1", "entity_type": "Patient", "entity_name": "Patient",
+                "source_tables": ["t1"], "source_columns": ["col_a"],
+                "attributes": {"granularity": "column", "discovery_method": "keyword"},
+                "confidence": 0.7, "validation_notes": None,
+            },
+            {
+                "entity_id": "2", "entity_type": "Patient", "entity_name": "Patient",
+                "source_tables": ["t1"], "source_columns": ["col_b"],
+                "attributes": {"granularity": "column", "discovery_method": "ai"},
+                "confidence": 0.9, "validation_notes": "high conf",
+            },
+        ]
+        result = EntityDiscoverer.deduplicate_entities(entities)
+        assert len(result) == 1
+        assert result[0]["confidence"] == 0.9
+        assert set(result[0]["source_columns"]) == {"col_a", "col_b"}
+
+    def test_merges_across_granularity(self):
+        """ai_batch (no granularity) and column_keyword (granularity=column) should merge."""
+        entities = [
+            {
+                "entity_id": "1", "entity_type": "Patient", "entity_name": "Patient",
+                "source_tables": ["t1"], "source_columns": ["col_a", "col_b"],
+                "attributes": {"discovery_method": "ai_batch"},
+                "confidence": 0.95, "validation_notes": None,
+            },
+            {
+                "entity_id": "2", "entity_type": "Patient", "entity_name": "Patient",
+                "source_tables": ["t1"], "source_columns": ["col_a", "col_c"],
+                "attributes": {"granularity": "column", "discovery_method": "column_keyword"},
+                "confidence": 0.9, "validation_notes": None,
+            },
+        ]
+        result = EntityDiscoverer.deduplicate_entities(entities)
+        assert len(result) == 1
+        assert result[0]["confidence"] == 0.95
+        assert set(result[0]["source_columns"]) == {"col_a", "col_b", "col_c"}
+
+    def test_keeps_different_entity_types(self):
+        entities = [
+            {
+                "entity_id": "1", "entity_type": "Patient", "entity_name": "Patient",
+                "source_tables": ["t1"], "source_columns": [],
+                "attributes": {"granularity": "table"}, "confidence": 0.8,
+                "validation_notes": None,
+            },
+            {
+                "entity_id": "2", "entity_type": "Encounter", "entity_name": "Encounter",
+                "source_tables": ["t1"], "source_columns": [],
+                "attributes": {"granularity": "table"}, "confidence": 0.7,
+                "validation_notes": None,
+            },
+        ]
+        result = EntityDiscoverer.deduplicate_entities(entities)
+        assert len(result) == 2
+
+
+# ==============================================================================
+# New tests for two-layer ontology improvements
+# ==============================================================================
+
+
+class TestEntityDefinitionRelationships:
+    """Tests for EntityDefinition.relationships field."""
+
+    def test_default_relationships_empty(self):
+        entity = EntityDefinition(name="Test", description="Test")
+        assert entity.relationships == {}
+
+    def test_relationships_set_on_creation(self):
+        rels = {
+            "treated_by": {"target": "Provider", "cardinality": "many-to-many"},
+            "has_encounter": {"target": "Encounter", "cardinality": "one-to-many"},
+        }
+        entity = EntityDefinition(
+            name="Patient", description="A patient", relationships=rels
+        )
+        assert len(entity.relationships) == 2
+        assert entity.relationships["treated_by"]["target"] == "Provider"
+        assert entity.relationships["has_encounter"]["cardinality"] == "one-to-many"
+
+
+class TestRelationshipsParsing:
+    """Tests for OntologyLoader.get_entity_definitions relationship parsing."""
+
+    def test_new_relationships_format(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Patient": {
+                        "description": "Patient entity",
+                        "keywords": ["patient"],
+                        "relationships": {
+                            "treated_by": {"target": "Provider", "cardinality": "many-to-many"},
+                            "has_encounter": {"target": "Encounter", "cardinality": "one-to-many"},
+                        },
+                    }
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        assert len(entities) == 1
+        p = entities[0]
+        assert len(p.relationships) == 2
+        assert p.relationships["treated_by"]["target"] == "Provider"
+        assert p.relationships["has_encounter"]["cardinality"] == "one-to-many"
+
+    def test_old_typical_relationships_backward_compat(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Person": {
+                        "description": "A person",
+                        "keywords": ["person"],
+                        "typical_relationships": ["owns", "contains"],
+                    }
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        p = entities[0]
+        assert "owns" in p.relationships
+        assert "contains" in p.relationships
+        assert p.relationships["owns"] == {}
+
+    def test_new_format_takes_precedence(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Order": {
+                        "description": "An order",
+                        "keywords": ["order"],
+                        "typical_relationships": ["references"],
+                        "relationships": {
+                            "placed_by": {"target": "Customer", "cardinality": "many-to-one"},
+                        },
+                    }
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        o = entities[0]
+        assert "placed_by" in o.relationships
+        assert "references" not in o.relationships
+
+    def test_no_relationships_field(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Ref": {"description": "Lookup", "keywords": ["ref"]}
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        assert entities[0].relationships == {}
+
+    def test_empty_relationships_map(self):
+        config = {
+            "entities": {
+                "definitions": {
+                    "Ref": {
+                        "description": "Lookup",
+                        "keywords": ["ref"],
+                        "relationships": {},
+                    }
+                }
+            }
+        }
+        entities = OntologyLoader.get_entity_definitions(config)
+        assert entities[0].relationships == {}
+
+
+class TestBestAttributeForColumn:
+    """Tests for EntityDiscoverer._best_attribute_for_column."""
+
+    def test_exact_match(self):
+        edef = EntityDefinition(
+            name="Patient", description="Patient",
+            typical_attributes=["id", "mrn", "name", "dob"]
+        )
+        assert EntityDiscoverer._best_attribute_for_column("mrn", edef) == "mrn"
+
+    def test_prefix_stripped(self):
+        edef = EntityDefinition(
+            name="Patient", description="Patient",
+            typical_attributes=["id", "mrn", "name", "dob"]
+        )
+        assert EntityDiscoverer._best_attribute_for_column("patient_mrn", edef) == "mrn"
+
+    def test_partial_match(self):
+        edef = EntityDefinition(
+            name="Order", description="Order",
+            typical_attributes=["id", "customer_id", "total", "status"]
+        )
+        result = EntityDiscoverer._best_attribute_for_column("order_status", edef)
+        assert result == "status"
+
+    def test_no_match_returns_stripped_name(self):
+        edef = EntityDefinition(
+            name="Patient", description="Patient",
+            typical_attributes=["id", "mrn"]
+        )
+        result = EntityDiscoverer._best_attribute_for_column("patient_custom_field", edef)
+        assert result == "custom_field"
+
+    def test_no_prefix_no_match(self):
+        edef = EntityDefinition(
+            name="Patient", description="Patient",
+            typical_attributes=["id", "mrn"]
+        )
+        result = EntityDiscoverer._best_attribute_for_column("random_col", edef)
+        assert result == "random_col"
+
+
+class TestDeclaredRelationshipLookup:
+    """Tests for discover_inter_entity_relationships declared relationship lookup logic."""
+
+    def _make_builder(self, entity_defs, ontology_config=None):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = ontology_config or OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        builder.discoverer.entity_definitions = entity_defs
+        return builder, mock_spark
+
+    def test_declared_rel_used_over_references(self):
+        """When a declared relationship matches (src_type, dst_type), use it."""
+        edefs = [
+            EntityDefinition(
+                name="Patient", description="Patient", keywords=["patient"],
+                relationships={"treated_by": {"target": "Provider", "cardinality": "many-to-many"}},
+            ),
+            EntityDefinition(name="Provider", description="Provider", keywords=["provider"]),
+        ]
+        builder, mock_spark = self._make_builder(edefs)
+
+        edge_chain = mock_spark.sql.return_value
+        count_mock = MagicMock(return_value=1)
+        edge_chain.count = count_mock
+        for attr in ("join", "where", "select", "distinct", "alias", "dropDuplicates"):
+            getattr(edge_chain, attr).return_value = edge_chain
+
+        edge_chain.cache.return_value = edge_chain
+        edge_chain.unpersist.return_value = edge_chain
+
+        matched_row = MagicMock()
+        matched_row.src_type, matched_row.dst_type = "Patient", "Provider"
+        edge_chain.collect.return_value = [matched_row]
+
+        result = builder.discover_inter_entity_relationships()
+        assert result["edges_added"] == 1
+        # declared_rels should include treated_by
+        decl_df_call = mock_spark.createDataFrame.call_args
+        if decl_df_call:
+            rows = decl_df_call[0][0]
+            rel_names = [r[2] for r in rows]
+            assert "treated_by" in rel_names
+
+    def test_undiscovered_declared_reported(self):
+        """Declared relationships with no matching FK should be reported."""
+        edefs = [
+            EntityDefinition(
+                name="Patient", description="Patient",
+                relationships={
+                    "treated_by": {"target": "Provider", "cardinality": "many-to-many"},
+                    "has_condition": {"target": "Condition", "cardinality": "one-to-many"},
+                },
+            ),
+            EntityDefinition(name="Provider", description="Provider"),
+            EntityDefinition(name="Condition", description="Condition"),
+        ]
+        builder, mock_spark = self._make_builder(edefs)
+
+        edge_chain = mock_spark.sql.return_value
+        count_mock = MagicMock(return_value=0)
+        edge_chain.count = count_mock
+        for attr in ("join", "where", "select", "distinct", "alias"):
+            getattr(edge_chain, attr).return_value = edge_chain
+        edge_chain.cache.return_value = edge_chain
+        edge_chain.unpersist.return_value = edge_chain
+        edge_chain.collect.return_value = []
+
+        result = builder.discover_inter_entity_relationships()
+        assert len(result["undiscovered_declared"]) == 2
+        names = {u["relationship"] for u in result["undiscovered_declared"]}
+        assert "treated_by" in names
+        assert "has_condition" in names
+
+    def test_fallback_to_references(self):
+        """When no declaration matches, fall back to 'references'."""
+        edefs = [
+            EntityDefinition(name="Event", description="Event"),
+            EntityDefinition(name="Ref", description="Reference"),
+        ]
+        builder, mock_spark = self._make_builder(edefs)
+
+        edge_chain = mock_spark.sql.return_value
+        count_mock = MagicMock(return_value=1)
+        edge_chain.count = count_mock
+        for attr in ("join", "where", "select", "distinct", "alias", "dropDuplicates"):
+            getattr(edge_chain, attr).return_value = edge_chain
+        edge_chain.cache.return_value = edge_chain
+        edge_chain.unpersist.return_value = edge_chain
+        edge_chain.collect.return_value = []
+
+        result = builder.discover_inter_entity_relationships()
+        assert result["edges_added"] == 1
+        # No declared relationships exist for Event->Ref, so no declared df created
+        # The relationship type would be "references" (default)
+
+
+class TestBundleYAMLRelationships:
+    """Tests that bundle YAML files contain structured relationships."""
+
+    @pytest.fixture(params=["healthcare", "general", "retail_cpg", "financial_services"])
+    def bundle_name(self, request):
+        return request.param
+
+    def test_bundle_has_relationships(self, bundle_name):
+        """Every entity in every bundle should have a relationships key."""
+        import os, yaml
+        bundle_dir = os.path.join(
+            os.path.dirname(__file__), "..", "configurations", "ontology_bundles"
+        )
+        path = os.path.join(bundle_dir, f"{bundle_name}.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        definitions = data.get("ontology", {}).get("entities", {}).get("definitions", {})
+        assert len(definitions) > 0, f"No definitions in {bundle_name}"
+        for name, defn in definitions.items():
+            assert "relationships" in defn, (
+                f"Entity '{name}' in bundle '{bundle_name}' missing relationships key"
+            )
+            assert isinstance(defn["relationships"], dict), (
+                f"Entity '{name}' relationships should be a dict"
+            )
+
+    def test_relationship_values_have_target(self, bundle_name):
+        """Non-empty relationships should declare a target entity."""
+        import os, yaml
+        bundle_dir = os.path.join(
+            os.path.dirname(__file__), "..", "configurations", "ontology_bundles"
+        )
+        path = os.path.join(bundle_dir, f"{bundle_name}.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        definitions = data["ontology"]["entities"]["definitions"]
+        for name, defn in definitions.items():
+            for rel_name, rel_info in defn.get("relationships", {}).items():
+                assert isinstance(rel_info, dict), (
+                    f"{name}.{rel_name} should be a dict with target/cardinality"
+                )
+                assert "target" in rel_info, (
+                    f"{name}.{rel_name} missing 'target'"
+                )
+                assert "cardinality" in rel_info, (
+                    f"{name}.{rel_name} missing 'cardinality'"
+                )
+
+
+# ======================================================================
+# _store_entities MERGE update + _purge_stale_bundle_entities
+# ======================================================================
+
+
+class TestStoreEntitiesMergeUpdate:
+    """Tests that _store_entities emits a MERGE with WHEN MATCHED THEN UPDATE."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_merge_contains_when_matched(self, builder):
+        entities = [{"entity_id": "e1", "entity_type": "T", "source_tables": ["t1"], "confidence": 0.8}]
+        builder._store_entities(entities)
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        merge_sql = [s for s in sql_calls if "MERGE INTO" in s]
+        assert len(merge_sql) == 1
+        assert "WHEN MATCHED" in merge_sql[0]
+        assert "auto_discovered = TRUE" in merge_sql[0]
+
+    def test_merge_uses_content_change_guard(self, builder):
+        """MERGE uses content-change guard to only update when discovery output differs."""
+        entities = [{"entity_id": "e1", "entity_type": "T", "source_tables": ["t1"], "confidence": 0.9}]
+        builder._store_entities(entities)
+        merge_sql = [c[0][0] for c in builder.spark.sql.call_args_list if "MERGE" in c[0][0]][0]
+        assert "target.confidence != source.confidence" in merge_sql
+        assert "target.validated = FALSE" in merge_sql
+        assert "target.validation_notes = NULL" in merge_sql
+
+    def test_full_mode_resets_validated_on_content_change(self):
+        """Full mode MERGE resets validated when content changes (content-change guard)."""
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", incremental=False)
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        entities = [{"entity_id": "e1", "entity_type": "T", "source_tables": ["t1"], "confidence": 0.8}]
+        builder._store_entities(entities)
+        merge_sql = [c[0][0] for c in mock_spark.sql.call_args_list if "MERGE" in c[0][0]][0]
+        assert "target.confidence != source.confidence" in merge_sql
+        assert "target.validated = FALSE" in merge_sql
+        assert "target.validation_notes = NULL" in merge_sql
+
+    def test_merge_updates_expected_columns(self, builder):
+        entities = [{"entity_id": "e1", "entity_type": "T", "source_tables": ["t1"], "confidence": 0.5}]
+        builder._store_entities(entities)
+        merge_sql = [c[0][0] for c in builder.spark.sql.call_args_list if "MERGE" in c[0][0]][0]
+        for col in ("confidence", "source_columns", "column_bindings", "bundle_version", "updated_at"):
+            assert f"target.{col} = source.{col}" in merge_sql
+        # attributes uses a granularity-preserving CASE (Fix 1a), not a plain copy.
+        assert "target.attributes = CASE" in merge_sql
+
+
+class TestPostMergeConfidenceClamp:
+    """Tests that _store_entities issues a post-MERGE UPDATE to clamp confidence."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_store_entities_issues_post_merge_clamp(self, builder):
+        entities = [{"entity_id": "e1", "entity_type": "T", "source_tables": ["t1"], "confidence": 0.8}]
+        builder._store_entities(entities)
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        post_merge = [s for s in sql_calls if "GREATEST(0.0" in s and "UPDATE" in s]
+        assert len(post_merge) >= 1, "Expected a post-MERGE confidence clamp UPDATE"
+        assert "discovery_confidence" in post_merge[0]
+
+    def test_create_entities_cleanup_covers_discovery_confidence(self):
+        src = inspect.getsource(OntologyBuilder.create_entities_table)
+        assert "discovery_confidence" in src
+        assert "GREATEST(0.0" in src
+
+    def test_create_entities_cleanup_uses_error_logging(self):
+        src = inspect.getsource(OntologyBuilder.create_entities_table)
+        assert "logger.error" in src
+
+
+class TestMultiBundleCoexistence:
+    """Verify that different bundles can coexist in the same output schema."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle="fhir_r4")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_discover_does_not_purge_other_bundles(self, builder):
+        """Incremental discover_and_store_entities must not DELETE entities from other bundles."""
+        builder.discoverer.discover_entities_from_tables = MagicMock(return_value=[])
+        builder.discover_and_store_entities()
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        delete_sqls = [s for s in sql_calls if "DELETE FROM" in s]
+        assert len(delete_sqls) == 0
+
+    def test_discover_and_store_skips_purge_when_no_bundle(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle=None)
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        builder.discoverer.discover_entities_from_tables = MagicMock(return_value=[])
+        builder.discover_and_store_entities()
+        sql_calls = [c[0][0] for c in mock_spark.sql.call_args_list]
+        delete_sqls = [s for s in sql_calls if "DELETE FROM" in s]
+        assert len(delete_sqls) == 0
+
+
+class TestNoPurgeOnDiscover:
+    """Verify that discover_and_store never issues DELETE, regardless of incremental flag."""
+
+    def test_no_delete_when_non_incremental(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(
+            catalog_name="cat", schema_name="sch",
+            ontology_bundle="schema_org", incremental=False,
+        )
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        b.discoverer.discover_entities_from_tables = MagicMock(return_value=[])
+        b.discover_and_store_entities()
+        sql_calls = [c[0][0] for c in mock_spark.sql.call_args_list]
+        delete_sqls = [s for s in sql_calls if "DELETE FROM" in s]
+        assert len(delete_sqls) == 0
+
+    def test_no_delete_when_incremental(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(
+            catalog_name="cat", schema_name="sch",
+            ontology_bundle="schema_org", incremental=True,
+        )
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        b.discoverer.discover_entities_from_tables = MagicMock(return_value=[])
+        b.discover_and_store_entities()
+        sql_calls = [c[0][0] for c in mock_spark.sql.call_args_list]
+        delete_sqls = [s for s in sql_calls if "DELETE FROM" in s]
+        assert len(delete_sqls) == 0
+
+
+# ======================================================================
+# Bundle version format alignment and mismatch warning
+# ======================================================================
+
+
+class TestBundleVersionFormat:
+    """OntologyBuilder._get_bundle_version must match EntityDiscoverer format."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle="fhir_r4")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            cfg = OntologyLoader._default_config()
+            cfg.setdefault("metadata", {})["version"] = "2.0"
+            mock_load.return_value = cfg
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    @pytest.fixture
+    def discoverer(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle="fhir_r4")
+        ontology_config = OntologyLoader._default_config()
+        ontology_config.setdefault("metadata", {})["version"] = "2.0"
+        return EntityDiscoverer(mock_spark, config, ontology_config)
+
+    def test_builder_includes_bundle_name(self, builder):
+        bv = builder._get_bundle_version()
+        assert bv.startswith("fhir_r4:")
+
+    def test_builder_and_discoverer_formats_match(self, builder, discoverer):
+        assert builder._get_bundle_version() == discoverer._get_bundle_version()
+
+    def test_default_bundle_fallback(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle="")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        assert b._get_bundle_version().startswith("default:")
+
+
+class TestBundleSwitchWarning:
+    """run() should warn when entities from a different bundle exist."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle="omop_cdm")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_warns_on_bundle_switch(self, builder, caplog):
+        import logging
+
+        call_count = [0]
+
+        def sql_side_effect(query):
+            call_count[0] += 1
+            result = MagicMock()
+            if "MAX(bundle_version)" in query:
+                row = MagicMock()
+                row.v = "fhir_r4:1.0"
+                result.collect.return_value = [row]
+                return result
+            if "DISTINCT ontology_bundle" in query:
+                row = MagicMock()
+                row.ontology_bundle = "fhir_r4"
+                result.collect.return_value = [row]
+                return result
+            # All subsequent calls: abort the run early
+            raise StopIteration("short-circuit")
+
+        builder.spark.sql.side_effect = sql_side_effect
+
+        with caplog.at_level(logging.WARNING, logger="dbxmetagen.ontology"):
+            try:
+                builder.run()
+            except StopIteration:
+                pass
+
+        assert any("bundle(s)" in m and "omop_cdm" in m for m in caplog.messages)
+
+    def test_no_warning_when_same_bundle(self, builder, caplog):
+        import logging
+
+        builder.config = OntologyConfig(
+            catalog_name="cat", schema_name="sch", ontology_bundle="fhir_r4"
+        )
+
+        def sql_side_effect(query):
+            result = MagicMock()
+            if "MAX(bundle_version)" in query:
+                row = MagicMock()
+                row.v = "fhir_r4:1.0"
+                result.collect.return_value = [row]
+                return result
+            if "DISTINCT ontology_bundle" in query:
+                row = MagicMock()
+                row.ontology_bundle = "fhir_r4"
+                result.collect.return_value = [row]
+                return result
+            raise StopIteration("short-circuit")
+
+        builder.spark.sql.side_effect = sql_side_effect
+
+        with caplog.at_level(logging.WARNING, logger="dbxmetagen.ontology"):
+            try:
+                builder.run()
+            except StopIteration:
+                pass
+
+        assert not any("bundle(s)" in m for m in caplog.messages)
+
+    def test_no_warning_on_empty_table(self, builder, caplog):
+        import logging
+
+        def sql_side_effect(query):
+            result = MagicMock()
+            if "MAX(bundle_version)" in query:
+                row = MagicMock()
+                row.v = None
+                result.collect.return_value = [row]
+                return result
+            if "DISTINCT ontology_bundle" in query:
+                result.collect.return_value = []
+                return result
+            raise StopIteration("short-circuit")
+
+        builder.spark.sql.side_effect = sql_side_effect
+
+        with caplog.at_level(logging.WARNING, logger="dbxmetagen.ontology"):
+            try:
+                builder.run()
+            except StopIteration:
+                pass
+
+        assert not any("bundle(s)" in m for m in caplog.messages)
+
+
+# ======================================================================
+# _heuristic_classify improvements
+# ======================================================================
+
+
+class TestHeuristicClassifyImprovements:
+    """Tests for self-referencing PK detection and downgraded _id/_key confidence."""
+
+    @pytest.fixture
+    def classifier(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        return builder
+
+    def test_self_referencing_pk_order_id_on_orders(self, classifier):
+        """order_id on cat.sch.orders -> primary_key, not object_property."""
+        role, method, conf = classifier._heuristic_classify(
+            "order_id", "BIGINT", False, None, "", table_name="cat.sch.orders",
+        )
+        assert role == "primary_key"
+        assert conf >= 0.80
+
+    def test_self_referencing_pk_customer_key_on_customers(self, classifier):
+        """customer_key on cat.sch.customers -> primary_key."""
+        role, method, conf = classifier._heuristic_classify(
+            "customer_key", "BIGINT", False, None, "", table_name="cat.sch.customers",
+        )
+        assert role == "primary_key"
+
+    def test_foreign_key_customer_id_on_orders(self, classifier):
+        """customer_id on cat.sch.orders -> object_property (not self-referencing)."""
+        role, method, conf = classifier._heuristic_classify(
+            "customer_id", "BIGINT", False, None, "", table_name="cat.sch.orders",
+        )
+        assert role == "object_property"
+        assert conf == 0.55
+        assert method == "heuristic_weak"
+
+    def test_ambiguous_id_column_low_confidence(self, classifier):
+        """Generic _id column without linked_entity gets low confidence."""
+        role, method, conf = classifier._heuristic_classify(
+            "region_id", "INT", False, None, "", table_name="cat.sch.orders",
+        )
+        assert role == "object_property"
+        assert conf == 0.55
+        assert method == "heuristic_weak"
+
+    def test_linked_entity_still_high_confidence(self, classifier):
+        """Column with linked_entity should remain object_property at 0.80."""
+        role, method, conf = classifier._heuristic_classify(
+            "provider_id", "BIGINT", False, "Provider", "", table_name="cat.sch.encounters",
+        )
+        assert role == "object_property"
+        assert conf == 0.80
+        assert method == "heuristic_strong"
+
+    def test_explicit_pk_column_still_primary_key(self, classifier):
+        """Column already in entity source_columns (is_pk_column=True) -> primary_key."""
+        role, method, conf = classifier._heuristic_classify(
+            "patient_id", "BIGINT", True, None, "", table_name="cat.sch.encounters",
+        )
+        assert role == "primary_key"
+        assert conf == 0.85
+
+    def test_no_table_name_falls_back_to_object_property(self, classifier):
+        """Without table_name, can't detect self-referencing PK."""
+        role, method, conf = classifier._heuristic_classify(
+            "order_id", "BIGINT", False, None, "",
+        )
+        assert role == "object_property"
+        assert conf == 0.55
+
+    def test_plural_table_strip(self, classifier):
+        """Plural table name: patient_id on patients -> primary_key."""
+        role, _, _ = classifier._heuristic_classify(
+            "patient_id", "BIGINT", False, None, "", table_name="cat.sch.patients",
+        )
+        assert role == "primary_key"
+
+
+class TestHeuristicNeverReturnsLink:
+    """Belt-and-suspenders: verify _heuristic_classify never returns 'link'."""
+
+    @pytest.fixture
+    def classifier(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        return builder
+
+    _REPRESENTATIVE_COLUMNS = [
+        ("order_id", "BIGINT", False, None, "", "cat.sch.orders"),
+        ("customer_id", "BIGINT", False, None, "", "cat.sch.orders"),
+        ("patient_id", "BIGINT", True, None, "", "cat.sch.encounters"),
+        ("provider_id", "BIGINT", False, "Provider", "", "cat.sch.encounters"),
+        ("name", "STRING", False, None, "", "cat.sch.customers"),
+        ("amount", "DECIMAL", False, None, "", "cat.sch.transactions"),
+        ("created_at", "TIMESTAMP", False, None, "", "cat.sch.logs"),
+        ("country_code", "STRING", False, None, "", "cat.sch.addresses"),
+        ("is_active", "BOOLEAN", False, None, "", "cat.sch.users"),
+        ("ssn", "STRING", False, None, "PII", "cat.sch.patients"),
+        ("icd_code", "STRING", False, None, "", "cat.sch.diagnoses"),
+        ("etl_timestamp", "TIMESTAMP", False, None, "", "cat.sch.raw"),
+        ("notes", "STRING", False, None, "", "cat.sch.encounters"),
+        ("year", "INT", False, None, "", "cat.sch.dim_time"),
+        ("unknown_field", "STRUCT", False, None, "", "cat.sch.misc"),
+    ]
+
+    @pytest.mark.parametrize("col,dtype,is_pk,linked,cls_type,tbl", _REPRESENTATIVE_COLUMNS)
+    def test_never_returns_link(self, classifier, col, dtype, is_pk, linked, cls_type, tbl):
+        role, method, conf = classifier._heuristic_classify(col, dtype, is_pk, linked, cls_type, table_name=tbl)
+        assert role != "link", f"_heuristic_classify returned 'link' for {col} on {tbl}"
+
+
+class TestEdgeCatalogInverse:
+    """Tests for EdgeCatalog inverse lookup and validation."""
+
+    def test_get_inverse_returns_name(self):
+        entries = {
+            "placed_by": EdgeCatalogEntry(name="placed_by", inverse="placed", domain="Transaction", range="Person"),
+        }
+        catalog = EdgeCatalog(entries)
+        assert catalog.get_inverse("placed_by") == "placed"
+
+    def test_get_inverse_returns_none_when_missing(self):
+        # An edge with no declared inverse and no built-in default returns None.
+        entries = {
+            "custom_edge": EdgeCatalogEntry(name="custom_edge"),
+        }
+        catalog = EdgeCatalog(entries)
+        assert catalog.get_inverse("custom_edge") is None
+
+    def test_get_inverse_falls_back_to_builtin_default(self):
+        # 'references' has no declared inverse but a built-in default (Fix 2a).
+        catalog = EdgeCatalog({"references": EdgeCatalogEntry(name="references")})
+        assert catalog.get_inverse("references") == "referenced_by"
+
+    def test_get_inverse_unknown_edge(self):
+        catalog = EdgeCatalog({})
+        assert catalog.get_inverse("nonexistent") is None
+
+    def test_validate_edge_domain_range(self):
+        entries = {
+            "placed_by": EdgeCatalogEntry(name="placed_by", inverse="placed", domain="Transaction", range="Person"),
+        }
+        catalog = EdgeCatalog(entries)
+        valid, _ = catalog.validate("placed_by", "Transaction", "Person")
+        assert valid
+        valid2, msg = catalog.validate("placed_by", "Person", "Transaction")
+        assert not valid2
+
+    def test_find_edge_by_domain_range(self):
+        entries = {
+            "belongs_to": EdgeCatalogEntry(name="belongs_to", domain="Product", range="Organization"),
+        }
+        catalog = EdgeCatalog(entries)
+        match = catalog.find_edge("Product", "Organization")
+        assert match is not None
+        assert match.name == "belongs_to"
+        assert catalog.find_edge("Organization", "Product") is None
+
+
+class TestResolveEdgeName:
+    """Tests for _resolve_edge_name with bundle property edge definitions."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+
+        edef = EntityDefinition(
+            name="Transaction",
+            description="A business transaction",
+            parent=None,
+            keywords=["order"],
+            properties=[
+                PropertyDefinition(
+                    name="placed_by",
+                    kind="object_property",
+                    role="object_property",
+                    typical_attributes=["customer_id", "buyer_id"],
+                    edge="placed_by",
+                    target_entity="Person",
+                ),
+            ],
+            relationships={"contains": {"target": "Product"}, "purchased_at": {"target": "Location"}},
+        )
+        builder.discoverer._entity_def_map = {"Transaction": edef}
+        builder.discoverer._edge_catalog = EdgeCatalog({
+            "placed_by": EdgeCatalogEntry(
+                name="placed_by", inverse="placed",
+                domain="Transaction", range="Person",
+            ),
+            "contains": EdgeCatalogEntry(
+                name="contains", inverse="contained_in",
+                domain="Transaction", range="Product",
+            ),
+        })
+        return builder
+
+    def test_bundle_property_edge_match(self, builder):
+        """Column matching bundle property with edge -> returns that edge name."""
+        name = builder._resolve_edge_name("Transaction", "Person", "customer_id")
+        assert name == "placed_by"
+
+    def test_legacy_relationship_block_blocklisted(self, builder):
+        """Blocklisted structural names in legacy relationships block fall through to 'references'."""
+        name = builder._resolve_edge_name("Transaction", "Product", "product_id")
+        assert name == "references"
+
+    def test_legacy_relationship_block_non_blocklisted(self, builder):
+        """Non-blocklisted names in legacy relationships block pass through."""
+        name = builder._resolve_edge_name("Transaction", "Location", None)
+        assert name == "purchased_at"
+
+    def test_fallback_to_references(self, builder):
+        """No match at all -> returns 'references'."""
+        name = builder._resolve_edge_name("Transaction", "UnknownEntity", "location_id")
+        assert name == "references"
+
+
+class TestBuildBundlePropertyIndex:
+    """Tests for _build_bundle_property_index bundle-match tier."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+
+        edef = EntityDefinition(
+            name="Transaction",
+            description="A business transaction",
+            parent=None,
+            keywords=["order"],
+            properties=[
+                PropertyDefinition(
+                    name="amount", kind="data_property", role="measure",
+                    typical_attributes=["total_amount", "order_amount", "amount"],
+                ),
+                PropertyDefinition(
+                    name="placed_by", kind="object_property", role="object_property",
+                    typical_attributes=["customer_id", "buyer_id"],
+                    edge="placed_by", target_entity="Person",
+                ),
+            ],
+            relationships={},
+        )
+        builder.discoverer._entity_def_map = {"Transaction": edef}
+        return builder
+
+    def test_index_maps_typical_attributes(self, builder):
+        index = builder._build_bundle_property_index("Transaction")
+        assert "total_amount" in index
+        assert index["total_amount"][0] == "measure"
+        assert "customer_id" in index
+        assert index["customer_id"][0] == "object_property"
+        assert index["customer_id"][2] == "placed_by"
+
+    def test_index_empty_for_unknown_entity(self, builder):
+        assert builder._build_bundle_property_index("Unknown") == {}
+
+    def test_index_case_insensitive(self, builder):
+        index = builder._build_bundle_property_index("Transaction")
+        assert "total_amount" in index
+        assert "TOTAL_AMOUNT" not in index
+
+
+class TestHealthcareBundlePropertyIndex:
+    """Verify healthcare bundle loads properties for Patient and Claim (ON-7)."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(
+            catalog_name="cat", schema_name="sch",
+            ontology_bundle="healthcare",
+        )
+        real_config = OntologyLoader.load_config(
+            "configurations/ontology_bundles/healthcare.yaml"
+        )
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = real_config
+            return OntologyBuilder(mock_spark, config)
+
+    def test_patient_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Patient")
+        assert index, "Patient bundle property index is empty -- properties not loaded"
+        assert "patient_id" in index, f"patient_id not in index. Keys: {sorted(index.keys())}"
+        assert index["patient_id"][0] == "primary_key"
+        assert "mrn" in index
+        assert "first_name" in index
+        assert index["first_name"][0] == "label"
+        assert "date_of_birth" in index
+        assert "gender" in index
+        assert index["gender"][0] == "dimension"
+
+    def test_claim_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Claim")
+        assert index, "Claim bundle property index is empty -- properties not loaded"
+        assert "claim_id" in index
+        assert index["claim_id"][0] == "primary_key"
+        assert "billed_amount" in index
+        assert index["billed_amount"][0] == "measure"
+        assert "service_date" in index
+        assert index["service_date"][0] == "temporal"
+
+    def test_encounter_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Encounter")
+        assert index, "Encounter bundle property index is empty"
+        assert "encounter_id" in index
+        assert index["encounter_id"][0] == "primary_key"
+
+    def test_entity_def_map_populated(self, builder):
+        """Verify _entity_def_map has healthcare entities with properties."""
+        emap = builder.discoverer._entity_def_map
+        for etype in ("Patient", "Claim", "Encounter", "Provider"):
+            edef = emap.get(etype)
+            assert edef is not None, f"{etype} not in _entity_def_map"
+            if etype in ("Patient", "Claim", "Encounter"):
+                assert edef.properties, f"{etype} has no properties"
+
+
+class TestFhirBundlePropertyIndex:
+    """Verify fhir_r4 bundle loads properties for Patient, Encounter, Observation, Claim."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(
+            catalog_name="cat", schema_name="sch",
+            ontology_bundle="fhir_r4",
+        )
+        real_config = OntologyLoader.load_config(
+            "configurations/ontology_bundles/fhir_r4.yaml"
+        )
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = real_config
+            return OntologyBuilder(mock_spark, config)
+
+    def test_patient_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Patient")
+        assert index, "Patient bundle property index is empty"
+        assert "id" in index
+        assert index["id"][0] == "primary_key"
+        assert "birth_date" in index
+        assert index["birth_date"][0] == "temporal"
+        assert "gender" in index
+        assert index["gender"][0] == "dimension"
+        assert "address" in index
+        assert index["address"][0] == "label"
+
+    def test_encounter_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Encounter")
+        assert index, "Encounter bundle property index is empty"
+        assert "id" in index
+        assert index["id"][0] == "primary_key"
+        assert "status" in index
+        assert index["status"][0] == "dimension"
+        assert "subject_id" in index or "patient_id" in index
+
+    def test_observation_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Observation")
+        assert index, "Observation bundle property index is empty"
+        assert "id" in index
+        assert "code" in index
+        assert index["code"][0] == "dimension"
+        assert "effective_date" in index or "effective_date_time" in index
+        assert "value_quantity" in index or "value" in index
+
+    def test_claim_index_has_properties(self, builder):
+        index = builder._build_bundle_property_index("Claim")
+        assert index, "Claim bundle property index is empty"
+        assert "id" in index
+        assert index["id"][0] == "primary_key"
+        assert "status" in index
+        assert index["status"][0] == "dimension"
+        assert "patient_id" in index
+
+    def test_entity_def_map_has_fhir_entities(self, builder):
+        emap = builder.discoverer._entity_def_map
+        for etype in ("Patient", "Encounter", "Observation", "Claim", "Condition", "Practitioner"):
+            edef = emap.get(etype)
+            assert edef is not None, f"{etype} not in _entity_def_map"
+            assert edef.properties, f"{etype} has no properties"
+
+    def test_property_count_reasonable(self, builder):
+        """Every FHIR entity with typical_attributes should have properties."""
+        emap = builder.discoverer._entity_def_map
+        entities_with_props = sum(1 for e in emap.values() if e.properties)
+        assert entities_with_props >= 100, f"Only {entities_with_props} entities have properties"
+
+
+# ======================================================================
+# Extended _enforce_entity_value tests (parity with domain _enforce_value)
+# ======================================================================
+
+ALL_ENTITY_TYPES = [
+    "Person", "Organization", "Product", "Transaction", "Location",
+    "Event", "Reference", "Metric", "Document", "Patient", "Provider",
+    "Encounter", "Condition", "Procedure", "Medication", "Observation",
+    "Claim", "Coverage", "DataTable",
+]
+
+
+class TestEnforceEntityValueExtended:
+    """Adversarial and parametrized tests mirroring domain classifier depth."""
+
+    # -- Exact match for every default entity type --
+    @pytest.mark.parametrize("entity", ALL_ENTITY_TYPES)
+    def test_exact_match_all_types(self, entity):
+        val, exact = _enforce_entity_value(entity, ALL_ENTITY_TYPES)
+        assert val == entity and exact is True
+
+    # -- Case variations --
+    @pytest.mark.parametrize("entity,predicted", [
+        ("Patient", "PATIENT"),
+        ("Patient", "patient"),
+        ("Patient", "pATIENT"),
+        ("Encounter", "encounter"),
+        ("Encounter", "ENCOUNTER"),
+        ("Organization", "organization"),
+        ("Organization", "ORGANIZATION"),
+        ("Transaction", "transaction"),
+        ("Observation", "observation"),
+        ("Medication", "MEDICATION"),
+        ("Coverage", "coverage"),
+    ])
+    def test_case_variations(self, entity, predicted):
+        val, exact = _enforce_entity_value(predicted, ALL_ENTITY_TYPES)
+        assert val == entity and exact is True
+
+    # -- LLM-realistic extended outputs (substring containment) --
+    @pytest.mark.parametrize("predicted,expected", [
+        ("Patient_Record", "Patient"),
+        ("Patient_Demographics", "Patient"),
+        ("Medical_Encounter", "Encounter"),
+        ("Encounter_Visit", "Encounter"),
+        ("Insurance_Claim", "Claim"),
+        ("Claim_Submission", "Claim"),
+        ("Lab_Observation", "Observation"),
+        ("Observation_Result", "Observation"),
+        ("Drug_Medication", "Medication"),
+        ("Medication_Order", "Medication"),
+        ("Healthcare_Provider", "Provider"),
+        ("Provider_Practitioner", "Provider"),
+        ("Business_Transaction", "Transaction"),
+        ("Transaction_Record", "Transaction"),
+        ("Product_Catalog", "Product"),
+        ("Reference_Lookup", "Reference"),
+        ("Metric_KPI", "Metric"),
+        ("Document_Content", "Document"),
+        ("Coverage_Plan", "Coverage"),
+        ("Location_Address", "Location"),
+        ("System_Event", "Event"),
+        ("Surgical_Procedure", "Procedure"),
+        ("Diagnosis_Condition", "Condition"),
+    ])
+    def test_llm_extended_names(self, predicted, expected):
+        val, exact = _enforce_entity_value(predicted, ALL_ENTITY_TYPES)
+        assert val == expected
+        assert exact is False
+
+    # -- Substring ambiguity: both entity names present in predicted string --
+    @pytest.mark.parametrize("predicted", [
+        "Provider_Organization",
+        "Event_Location",
+        "Product_Transaction",
+        "Patient_Encounter",
+        "Condition_Procedure",
+    ])
+    def test_ambiguous_substring_does_not_crash(self, predicted):
+        """Ambiguous inputs must return a valid entity, never crash or fallback."""
+        val, exact = _enforce_entity_value(predicted, ALL_ENTITY_TYPES)
+        assert val in ALL_ENTITY_TYPES
+        assert val != "DataTable"
+        assert exact is False
+
+    # -- Reverse containment (predicted is a prefix/substring of allowed) --
+    @pytest.mark.parametrize("predicted,expected", [
+        ("Med", "Medication"),
+        ("Proc", "Procedure"),
+        ("Obs", "Observation"),
+        ("Cov", "Coverage"),
+        ("Trans", "Transaction"),
+        ("Org", "Organization"),
+        ("Cond", "Condition"),
+        ("Loc", "Location"),
+        ("Ref", "Reference"),
+        ("Prod", "Product"),
+    ])
+    def test_reverse_containment(self, predicted, expected):
+        val, exact = _enforce_entity_value(predicted, ALL_ENTITY_TYPES)
+        assert val == expected
+        assert exact is False
+
+    def test_reverse_containment_enc_is_ambiguous(self):
+        """'enc' is a substring of both 'Reference' and 'Encounter';
+        iteration order determines the winner. Verify it doesn't crash
+        and returns a valid entity (not the fallback)."""
+        val, exact = _enforce_entity_value("Enc", ALL_ENTITY_TYPES)
+        assert val in ("Reference", "Encounter")
+        assert exact is False
+
+    # -- Fallback to DataTable for garbage inputs --
+    @pytest.mark.parametrize("garbage", [
+        "xyzzy_unknown",
+        "12345",
+        "definitely_not_an_entity",
+        "banana_split_sundae",
+        "asdfghjkl",
+        "the quick brown fox",
+    ])
+    def test_garbage_returns_fallback(self, garbage):
+        val, exact = _enforce_entity_value(garbage, ALL_ENTITY_TYPES)
+        assert val == "DataTable"
+        assert exact is False
+
+    def test_empty_string_matches_first_via_substring(self):
+        """Empty string is a substring of every allowed value, so the first
+        entity wins via iteration order. This documents actual behavior."""
+        val, exact = _enforce_entity_value("", ALL_ENTITY_TYPES)
+        assert val in ALL_ENTITY_TYPES
+        assert exact is False
+
+    def test_whitespace_matches_first_via_substring(self):
+        """Whitespace-only strips to empty, same as above."""
+        val, exact = _enforce_entity_value("   ", ALL_ENTITY_TYPES)
+        assert val in ALL_ENTITY_TYPES
+        assert exact is False
+
+    def test_custom_fallback(self):
+        val, exact = _enforce_entity_value("xyzzy", ALL_ENTITY_TYPES, fallback="Other")
+        assert val == "Other"
+        assert exact is False
+
+    def test_empty_allowed_list_returns_fallback(self):
+        val, exact = _enforce_entity_value("Patient", [])
+        assert val == "DataTable"
+        assert exact is False
+
+    def test_return_types_always_str_bool(self):
+        """Contract: always returns (str, bool), never None."""
+        val, exact = _enforce_entity_value("anything", ALL_ENTITY_TYPES)
+        assert isinstance(val, str)
+        assert isinstance(exact, bool)
+
+
+# ======================================================================
+# Negative tests: _enforce_entity_value never returns a wrong type
+# ======================================================================
+
+
+class TestEnforceEntityValueNeverReturnsWrongType:
+    """Garbage strings must always map to the fallback, never a real entity."""
+
+    ALLOWED = [e for e in ALL_ENTITY_TYPES if e != "DataTable"]
+
+    @pytest.mark.parametrize("garbage", [
+        "zebra_crossing_data",
+        "foobar_baz_qux",
+        "aaaabbbbcccc",
+        "___---!!!",
+        "lorem ipsum dolor sit amet",
+        "1234567890",
+        "SELECT * FROM",
+        "null",
+        "undefined",
+        "NaN",
+    ])
+    def test_garbage_never_matches_real_entity(self, garbage):
+        val, exact = _enforce_entity_value(garbage, self.ALLOWED)
+        assert val == "DataTable", f"'{garbage}' should not match any entity, got '{val}'"
+        assert exact is False
+
+
+# ======================================================================
+# Extended _keyword_prefilter tests
+# ======================================================================
+
+
+class TestKeywordPrefilterExtended:
+    """Deeper coverage for entity prefiltering logic."""
+
+    def _make_discoverer(self):
+        ontology_config = OntologyLoader._default_config()
+        return EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+
+    def test_patient_encounters_includes_patient(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("patient_encounters", "admission records", "healthcare")
+        assert "Patient" in result
+
+    def test_patient_encounters_includes_encounter(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("patient_encounters", "admission records", "healthcare")
+        assert "Encounter" in result
+
+    def test_lab_results_includes_observation(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("lab_results", "laboratory test results", "healthcare")
+        assert "Observation" in result
+
+    def test_claim_submissions_includes_claim(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("claim_submissions", "insurance claims", "healthcare")
+        assert "Claim" in result
+
+    def test_finance_domain_transactions(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("daily_transactions", "payment records", "finance")
+        assert "Transaction" in result
+
+    def test_unknown_domain_keyword_match(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("customer_orders", "order history", "unknown")
+        entity_names = set(result)
+        assert "Transaction" in entity_names or "Person" in entity_names
+
+    def test_top_n_small_still_finds_strong_signal(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("patient_records", "medical records", "healthcare", top_n=2)
+        assert len(result) == 2
+        assert "Patient" in result
+
+    def test_empty_inputs_do_not_crash(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("", "", "unknown", top_n=3)
+        assert isinstance(result, list)
+        assert len(result) == 3
+
+    def test_medication_table_includes_medication(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("prescription_drugs", "pharmacy medication orders", "healthcare")
+        assert "Medication" in result
+
+    def test_provider_table_includes_provider(self):
+        d = self._make_discoverer()
+        result = d._keyword_prefilter("physician_directory", "provider npi registry", "healthcare")
+        assert "Provider" in result
+
+
+# ======================================================================
+# DEFAULT_CLASSIFICATION_MODEL consolidation verification
+# ======================================================================
+
+
+class TestClassificationModelConsolidation:
+    """Verify the constant is the single source of truth across modules."""
+
+    def test_config_and_ontology_share_same_constant(self):
+        from dbxmetagen.config import DEFAULT_CLASSIFICATION_MODEL as CONFIG_MODEL
+        from dbxmetagen.ontology import DEFAULT_CLASSIFICATION_MODEL as ONTOLOGY_MODEL
+        assert CONFIG_MODEL == ONTOLOGY_MODEL
+
+    def test_constant_is_claude_sonnet(self):
+        from dbxmetagen.config import DEFAULT_CLASSIFICATION_MODEL
+        assert DEFAULT_CLASSIFICATION_MODEL == "databricks-claude-sonnet-4-6"
+
+
+# ======================================================================
+# Enrich graph nodes with ontology data
+# ======================================================================
+
+
+class TestEnrichTableNodesWithOntology:
+    """Tests for _enrich_table_nodes_with_ontology."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_issues_merge_into_graph_nodes(self, builder):
+        mock_result = MagicMock()
+        mock_result.collect.return_value = [MagicMock(cnt=5)]
+        builder.spark.sql.return_value = mock_result
+        count = builder._enrich_table_nodes_with_ontology()
+        all_sql = [c[0][0] for c in builder.spark.sql.call_args_list]
+        merge_sql = all_sql[0]
+        assert "MERGE INTO" in merge_sql
+        assert "graph_nodes" in merge_sql
+        assert "ontology_id" in merge_sql
+        assert "ontology_type" in merge_sql
+        assert "node_type = 'table'" in merge_sql
+        assert count == 5
+
+    def test_filters_primary_entities_only(self, builder):
+        mock_result = MagicMock()
+        mock_result.collect.return_value = [MagicMock(cnt=0)]
+        builder.spark.sql.return_value = mock_result
+        builder._enrich_table_nodes_with_ontology()
+        merge_sql = builder.spark.sql.call_args_list[0][0][0]
+        assert "'primary'" in merge_sql
+
+    def test_returns_zero_on_failure(self, builder):
+        builder.spark.sql.side_effect = Exception("table not found")
+        assert builder._enrich_table_nodes_with_ontology() == 0
+
+    def test_uses_correct_table_names(self, builder):
+        mock_result = MagicMock()
+        mock_result.collect.return_value = [MagicMock(cnt=0)]
+        builder.spark.sql.return_value = mock_result
+        builder._enrich_table_nodes_with_ontology()
+        merge_sql = builder.spark.sql.call_args_list[0][0][0]
+        assert "cat.sch.graph_nodes" in merge_sql
+        assert "cat.sch.ontology_entities" in merge_sql
+
+
+class TestBuildSameEntityTypeEdges:
+    """Tests for _build_same_entity_type_edges (returns DataFrame, no INSERT)."""
+
+    @pytest.fixture
+    def builder(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            b = OntologyBuilder(mock_spark, config)
+        return b
+
+    def test_no_pairs_returns_none(self, builder):
+        mock_df = MagicMock()
+        mock_df.count.return_value = 0
+        builder.spark.sql.return_value = mock_df
+        assert builder._build_same_entity_type_edges() is None
+
+    def test_self_join_uses_less_than_to_dedupe(self, builder):
+        mock_df = MagicMock()
+        mock_df.count.return_value = 0
+        builder.spark.sql.return_value = mock_df
+        builder._build_same_entity_type_edges()
+        join_sql = builder.spark.sql.call_args_list[0][0][0]
+        assert "a.table_name < b.table_name" in join_sql
+
+    def test_join_requires_same_ontology_bundle(self, builder):
+        # Guard against spurious cross-dataset links: two entities sharing a type
+        # name under DIFFERENT bundles must NOT be joined. The self-join must key on
+        # ontology_bundle equality (with COALESCE so null/single-bundle still matches).
+        mock_df = MagicMock()
+        mock_df.count.return_value = 0
+        builder.spark.sql.return_value = mock_df
+        builder._build_same_entity_type_edges()
+        join_sql = builder.spark.sql.call_args_list[0][0][0]
+        assert "a.ontology_bundle = b.ontology_bundle" in join_sql
+        assert "COALESCE(ontology_bundle, '_default')" in join_sql
+
+    def test_returns_dataframe_when_pairs_exist(self, builder):
+        mock_df = MagicMock()
+        mock_df.count.return_value = 3
+        mock_df.select.return_value = mock_df
+        builder.spark.sql.return_value = mock_df
+        result = builder._build_same_entity_type_edges()
+        assert result is not None
+
+    def test_returns_none_on_failure(self, builder):
+        builder.spark.sql.side_effect = Exception("boom")
+        assert builder._build_same_entity_type_edges() is None
+
+
+class TestOntologyEdgeDeduplication:
+    """Verify all ontology edge builders deduplicate by edge_id before MERGE."""
+
+    def test_build_structural_edges_deduplicates(self):
+        source = inspect.getsource(OntologyBuilder._build_structural_edges)
+        assert "dropDuplicates" in source, "_build_structural_edges must deduplicate by edge_id"
+
+    def test_discover_inter_entity_relationships_deduplicates(self):
+        source = inspect.getsource(OntologyBuilder.discover_inter_entity_relationships)
+        assert "dropDuplicates" in source, "discover_inter_entity_relationships must deduplicate by edge_id"
+
+    def test_run_deduplicates_combined_edges(self):
+        source = inspect.getsource(OntologyBuilder.run)
+        assert "dropDuplicates" in source, "run() must deduplicate combined edges by edge_id"
+
+    def test_refresh_relationships_deduplicates_combined_edges(self):
+        source = inspect.getsource(OntologyBuilder.refresh_relationships)
+        assert "dropDuplicates" in source, "refresh_relationships() must deduplicate combined edges by edge_id"
+
+
+# ======================================================================
+# Primary entity deduplication
+# ======================================================================
+
+
+class TestDeduplicatePrimaryEntities:
+    """Verify _deduplicate_primary_entities respects human-created entities."""
+
+    def test_source_has_auto_discovered_guard(self):
+        from dbxmetagen.ontology import _deduplicate_primary_entities_sql
+        source = inspect.getsource(_deduplicate_primary_entities_sql)
+        assert "auto_discovered = TRUE" in source, (
+            "_deduplicate_primary_entities must only demote auto-discovered entities"
+        )
+
+    def test_source_ranks_human_created_first(self):
+        from dbxmetagen.ontology import _deduplicate_primary_entities_sql
+        source = inspect.getsource(_deduplicate_primary_entities_sql)
+        assert "auto_discovered = FALSE THEN 0" in source, (
+            "_deduplicate_primary_entities must rank human-created entities first"
+        )
+
+    def test_run_calls_deduplication(self):
+        source = inspect.getsource(OntologyBuilder.run)
+        assert "_deduplicate_primary_entities" in source, (
+            "run() must call _deduplicate_primary_entities after classify_entity_roles"
+        )
+
+
+class TestBuildStructuralEdgesFiltersConfigured:
+    """Verify _build_structural_edges excludes configured hierarchy edges."""
+
+    def test_filters_configured_source(self):
+        source = inspect.getsource(OntologyBuilder._build_structural_edges)
+        assert "source != 'configured'" in source, (
+            "_build_structural_edges must filter out configured hierarchy relationships"
+        )
+
+
+# ======================================================================
+# Numeric heuristic refinements
+# ======================================================================
+
+
+class TestHeuristicNumericRefinements:
+    """Verify numeric columns with temporal/ordinal/count suffixes are not blindly classified as measure."""
+
+    @pytest.fixture
+    def classifier(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch")
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            builder = OntologyBuilder(mock_spark, config)
+        return builder
+
+    @pytest.mark.parametrize("col", [
+        "onset_day", "resolution_days", "visit_day", "start_year",
+        "birth_year", "duration_hours", "elapsed_minutes", "age_months",
+        "tenure_weeks",
+    ])
+    def test_temporal_offset_columns(self, classifier, col):
+        role, method, conf = classifier._heuristic_classify(
+            col, "INT", False, None, "", table_name="cat.sch.events",
+        )
+        assert role == "temporal", f"{col} should be temporal, got {role}"
+
+    @pytest.mark.parametrize("col", [
+        "ecog_score", "pain_grade", "star_rating", "priority_rank",
+        "risk_level", "support_tier", "schema_version", "api_revision",
+    ])
+    def test_ordinal_score_columns(self, classifier, col):
+        role, method, conf = classifier._heuristic_classify(
+            col, "INT", False, None, "", table_name="cat.sch.records",
+        )
+        assert role == "dimension", f"{col} should be dimension, got {role}"
+
+    @pytest.mark.parametrize("col", [
+        "employee_count", "bed_count", "version_number", "line_num",
+        "item_qty",
+    ])
+    def test_count_dimension_columns(self, classifier, col):
+        role, method, conf = classifier._heuristic_classify(
+            col, "INT", False, None, "", table_name="cat.sch.orgs",
+        )
+        assert role == "dimension", f"{col} should be dimension, got {role}"
+
+    @pytest.mark.parametrize("col", [
+        "total_amount", "unit_price", "revenue", "discount_percent",
+    ])
+    def test_genuine_measure_columns_unchanged(self, classifier, col):
+        role, method, conf = classifier._heuristic_classify(
+            col, "DOUBLE", False, None, "", table_name="cat.sch.orders",
+        )
+        assert role == "measure", f"{col} should remain measure, got {role}"
+
+
+# ======================================================================
+# OntologyValidator -- batched column validation
+# ======================================================================
+
+from pyspark.sql.utils import AnalysisException
+from dbxmetagen.ontology_validator import (
+    OntologyValidator,
+    OntologyValidatorConfig,
+    MAX_ENTITIES_PER_PROMPT,
+    RETRY_ENTITIES_PER_PROMPT,
+    CIRCUIT_BREAKER_THRESHOLD,
+)
+
+
+class TestParseAiArray:
+    """Tests for _parse_ai_array truncation-resilient parser."""
+
+    def test_parses_clean_array(self):
+        text = '[{"entity_id": "a", "is_valid": true}, {"entity_id": "b", "is_valid": false}]'
+        items, missing = OntologyValidator._parse_ai_array(text, ["a", "b"])
+        assert len(items) == 2
+        assert missing == []
+
+    def test_handles_markdown_fences(self):
+        text = '```json\n[{"entity_id": "x", "is_valid": true}]\n```'
+        items, missing = OntologyValidator._parse_ai_array(text, ["x"])
+        assert len(items) == 1
+        assert missing == []
+
+    def test_recovers_truncated_array(self):
+        text = '[{"entity_id": "a", "is_valid": true}, {"entity_id": "b", "is_val'
+        items, missing = OntologyValidator._parse_ai_array(text, ["a", "b"])
+        assert len(items) == 1
+        assert items[0]["entity_id"] == "a"
+        assert "b" in missing
+
+    def test_empty_response_returns_all_missing(self):
+        items, missing = OntologyValidator._parse_ai_array("", ["a", "b"])
+        assert items == []
+        assert set(missing) == {"a", "b"}
+
+    def test_no_bracket_returns_all_missing(self):
+        items, missing = OntologyValidator._parse_ai_array("No JSON here", ["x"])
+        assert items == []
+        assert missing == ["x"]
+
+    def test_tracks_missing_entity_ids(self):
+        text = '[{"entity_id": "a", "is_valid": true}]'
+        items, missing = OntologyValidator._parse_ai_array(text, ["a", "b", "c"])
+        assert len(items) == 1
+        assert set(missing) == {"b", "c"}
+
+    def test_total_parse_failure_returns_all_missing(self):
+        text = '[not valid json at all}'
+        items, missing = OntologyValidator._parse_ai_array(text, ["a", "b"])
+        assert items == []
+        assert set(missing) == {"a", "b"}
+
+
+class TestBuildEntitySection:
+
+    def test_with_column_bindings(self):
+        entity = {
+            "entity_id": "abc",
+            "entity_type": "Patient",
+            "confidence": 0.85,
+            "discovery_method": "keyword",
+            "column_bindings": [
+                {"attribute_name": "identifier", "bound_table": "t", "bound_column": "patient_id"},
+            ],
+            "source_columns": ["patient_id"],
+        }
+        section = OntologyValidator._build_entity_section(entity)
+        assert "Patient" in section
+        assert "patient_id" in section
+        assert "Patient.identifier" in section
+
+    def test_without_bindings_uses_source_columns(self):
+        entity = {
+            "entity_id": "abc",
+            "entity_type": "Address",
+            "confidence": 0.7,
+            "discovery_method": "ai_batch",
+            "column_bindings": [],
+            "source_columns": ["addr_line1", "addr_city"],
+        }
+        section = OntologyValidator._build_entity_section(entity)
+        assert "addr_line1" in section
+        assert "addr_city" in section
+
+
+class TestBuildBatchPrompt:
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_multi_table_prompt(self, validator):
+        entities = [
+            {
+                "entity_id": "e1", "entity_type": "Patient", "table_name": "t1",
+                "table_comment": "Patient records", "domain": "Healthcare",
+                "source_columns": ["pid"], "column_bindings": [],
+                "confidence": 0.9, "discovery_method": "keyword",
+            },
+            {
+                "entity_id": "e2", "entity_type": "Claim", "table_name": "t2",
+                "table_comment": "Claims data", "domain": "Healthcare",
+                "source_columns": ["claim_id"], "column_bindings": [],
+                "confidence": 0.7, "discovery_method": "ai_batch",
+            },
+        ]
+        prompt = validator._build_batch_prompt(entities)
+        assert "t1" in prompt
+        assert "t2" in prompt
+        assert "Patient" in prompt
+        assert "Claim" in prompt
+        assert "JSON array" in prompt
+
+
+class TestRunAiQueryBatch:
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_empty_input_returns_empty(self, validator):
+        s, f = validator._run_ai_query_batch([])
+        assert s == []
+        assert f == []
+
+    def test_circuit_breaker_all_null(self, validator):
+        mock_row = MagicMock()
+        mock_row.response = None
+        mock_row.entity_ids = ["a"]
+        mock_df = MagicMock()
+        mock_df.collect.return_value = [mock_row]
+        validator.spark.sql.return_value = mock_df
+        validator.spark.createDataFrame.return_value = MagicMock()
+
+        with pytest.raises(RuntimeError, match="all .* AI_QUERY calls returned errors"):
+            validator._run_ai_query_batch([{
+                "chunk_id": "0", "entity_ids": ["a"], "prompt_text": "test"
+            }])
+
+    def test_circuit_breaker_majority_null(self, validator):
+        row_ok = MagicMock()
+        row_ok.response = '[{"entity_id":"a","is_valid":true}]'
+        row_ok.entity_ids = ["a"]
+        row_fail1 = MagicMock()
+        row_fail1.response = None
+        row_fail1.entity_ids = ["b"]
+        row_fail2 = MagicMock()
+        row_fail2.response = None
+        row_fail2.entity_ids = ["c"]
+
+        mock_df = MagicMock()
+        mock_df.collect.return_value = [row_ok, row_fail1, row_fail2]
+        validator.spark.sql.return_value = mock_df
+        validator.spark.createDataFrame.return_value = MagicMock()
+
+        with pytest.raises(RuntimeError, match="model serving issue"):
+            validator._run_ai_query_batch([
+                {"chunk_id": "0", "entity_ids": ["a"], "prompt_text": "t1"},
+                {"chunk_id": "1", "entity_ids": ["b"], "prompt_text": "t2"},
+                {"chunk_id": "2", "entity_ids": ["c"], "prompt_text": "t3"},
+            ])
+
+    def test_partial_failure_below_threshold(self, validator):
+        row_ok1 = MagicMock()
+        row_ok1.response = '[{"entity_id":"a","is_valid":true}]'
+        row_ok1.entity_ids = ["a"]
+        row_ok2 = MagicMock()
+        row_ok2.response = '[{"entity_id":"b","is_valid":true}]'
+        row_ok2.entity_ids = ["b"]
+        row_fail = MagicMock()
+        row_fail.response = None
+        row_fail.entity_ids = ["c"]
+
+        mock_df = MagicMock()
+        mock_df.collect.return_value = [row_ok1, row_ok2, row_fail]
+        validator.spark.sql.return_value = mock_df
+        validator.spark.createDataFrame.return_value = MagicMock()
+
+        successes, failures = validator._run_ai_query_batch([
+            {"chunk_id": "0", "entity_ids": ["a"], "prompt_text": "t1"},
+            {"chunk_id": "1", "entity_ids": ["b"], "prompt_text": "t2"},
+            {"chunk_id": "2", "entity_ids": ["c"], "prompt_text": "t3"},
+        ])
+        assert len(successes) == 2
+        assert len(failures) == 1
+
+
+class TestBatchUpdateEntityValidation:
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_empty_results(self, validator):
+        assert validator.batch_update_entity_validation([]) == 0
+
+    def test_merge_sql_executed(self, validator):
+        results = [{
+            "entity_id": "e1",
+            "validation_result": {"is_valid": True, "confidence_adjustment": 0.1, "reasoning": "ok"},
+        }]
+        validator.spark.createDataFrame.return_value = MagicMock()
+        count = validator.batch_update_entity_validation(results)
+        assert count == 1
+        merge_sql = validator.spark.sql.call_args[0][0]
+        assert "MERGE INTO" in merge_sql
+        assert "cat.sch.ontology_entities" in merge_sql
+
+    def test_falls_back_to_per_entity_on_merge_failure(self, validator):
+        results = [{
+            "entity_id": "e1",
+            "validation_result": {"is_valid": True, "confidence_adjustment": 0, "reasoning": "ok"},
+        }]
+        validator.spark.createDataFrame.return_value = MagicMock()
+        validator.spark.sql.side_effect = [Exception("MERGE failed"), None]
+        with patch.object(validator, 'update_entity_validation', return_value=1) as mock_update:
+            count = validator.batch_update_entity_validation(results)
+            mock_update.assert_called_once()
+            assert count == 1
+
+
+class TestRunWithValidateColumns:
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        v = OntologyValidator(mock_spark, config)
+        return v
+
+    def test_columns_skipped_by_default(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])) as mock_tbl, \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0), \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=0), \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            result = validator.run()
+            mock_tbl.assert_called_once()
+            assert result["column_entities_validated"] == 0
+
+    def test_columns_validated_when_opted_in(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])) as mock_tbl, \
+             patch.object(validator, 'validate_column_entities_batched', return_value=([], [])) as mock_col, \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0), \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=0), \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            result = validator.run(validate_columns=True)
+            mock_tbl.assert_called_once()
+            mock_col.assert_called_once()
+
+
+class TestContradictionInBatchedPath:
+    """Verify _detect_contradiction is applied to batched column validation results."""
+
+    def test_contradiction_flips_is_valid(self):
+        result = {
+            "entity_id": "e1",
+            "is_valid": True,
+            "confidence_adjustment": 0.1,
+            "reasoning": "This aligns with a Medication entity",
+            "suggested_type": "Medication",
+        }
+        checked = OntologyValidator._detect_contradiction(result, "Patient")
+        assert checked["is_valid"] is False
+        assert checked["confidence_adjustment"] <= -0.3
+
+    def test_no_contradiction_when_types_match(self):
+        result = {
+            "entity_id": "e1",
+            "is_valid": True,
+            "confidence_adjustment": 0.2,
+            "reasoning": "Correct classification",
+            "suggested_type": "Patient",
+        }
+        checked = OntologyValidator._detect_contradiction(result, "Patient")
+        assert checked["is_valid"] is True
+        assert checked["confidence_adjustment"] == 0.2
+
+    def test_no_contradiction_without_suggested_type(self):
+        result = {
+            "entity_id": "e1",
+            "is_valid": True,
+            "confidence_adjustment": 0.0,
+            "reasoning": "looks fine",
+        }
+        checked = OntologyValidator._detect_contradiction(result, "Patient")
+        assert checked["is_valid"] is True
+
+
+class TestColumnBindingsFallback:
+    """Verify column_bindings fallback when column doesn't exist in table."""
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_fallback_on_exception(self, validator):
+        """When first SQL raises, second query without column_bindings is used."""
+        mock_row = MagicMock()
+        mock_row.entity_id = "e1"
+        mock_row.entity_type = "Patient"
+        mock_row.table_name = "t1"
+        mock_row.source_columns = ["col1"]
+        mock_row.confidence = 0.8
+        mock_row.discovery_method = "keyword"
+        mock_row.table_comment = "a table"
+        mock_row.domain = "healthcare"
+
+        call_count = [0]
+        def sql_side_effect(query):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise AnalysisException("column_bindings not found")
+            mock_df = MagicMock()
+            mock_df.collect.return_value = [mock_row]
+            return mock_df
+
+        validator.spark.sql.side_effect = sql_side_effect
+
+        with patch.object(validator, '_run_ai_query_batch', return_value=([], [])):
+            results, unvalidated = validator.validate_column_entities_batched()
+
+        assert call_count[0] == 2
+        assert len(unvalidated) == 0 or len(results) == 0
+
+    def test_no_fallback_when_column_exists(self, validator):
+        """Normal path: first SQL succeeds, no fallback needed."""
+        mock_row = MagicMock()
+        mock_row.entity_id = "e1"
+        mock_row.entity_type = "Patient"
+        mock_row.table_name = "t1"
+        mock_row.source_columns = ["col1"]
+        mock_row.column_bindings = None
+        mock_row.confidence = 0.8
+        mock_row.discovery_method = "keyword"
+        mock_row.table_comment = "a table"
+        mock_row.domain = "healthcare"
+
+        mock_df = MagicMock()
+        mock_df.collect.return_value = [mock_row]
+        validator.spark.sql.return_value = mock_df
+
+        with patch.object(validator, '_run_ai_query_batch', return_value=([], [])):
+            results, unvalidated = validator.validate_column_entities_batched()
+
+        validator.spark.sql.assert_called_once()
+
+
+class TestTableBatchValidation:
+    """Tests for validate_table_entities_batched and related methods."""
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_build_table_entity_section(self):
+        entity = {
+            "entity_id": "e1",
+            "entity_name": "Patient",
+            "entity_type": "Person",
+            "confidence": 0.9,
+            "description": "A patient record",
+            "source_tables": ["schema.patients"],
+            "table_metadata": "  Comment: Patient info\n  Domain: healthcare",
+            "column_metadata": "  - patient_id (INT)\n  - name (STRING)",
+        }
+        section = OntologyValidator._build_table_entity_section(entity)
+        assert "Entity (id: e1):" in section
+        assert "Name: Patient" in section
+        assert "Type: Person" in section
+        assert "A patient record" in section
+        assert "schema.patients" in section
+        assert "patient_id" in section
+
+    def test_validate_table_entities_batched_empty(self, validator):
+        mock_df = MagicMock()
+        mock_df.collect.return_value = []
+        validator.spark.sql.return_value = mock_df
+
+        results, unvalidated = validator.validate_table_entities_batched()
+        assert results == []
+        assert unvalidated == []
+
+    def test_validate_table_entities_batched_basic(self, validator):
+        entity_row = MagicMock()
+        entity_row.entity_id = "e1"
+        entity_row.entity_name = "Patient"
+        entity_row.entity_type = "Person"
+        entity_row.description = "A patient"
+        entity_row.source_tables = ["t1"]
+        entity_row.source_columns = ["col1"]
+        entity_row.confidence = 0.8
+        entity_row.table_comment = "table about patients"
+        entity_row.domain = "healthcare"
+
+        col_row = MagicMock()
+        col_row.table_name = "t1"
+        col_row.column_name = "col1"
+        col_row.data_type = "STRING"
+        col_row.classification = None
+        col_row.comment = "patient name"
+
+        call_count = [0]
+        def sql_side_effect(query):
+            call_count[0] += 1
+            mock_df = MagicMock()
+            if call_count[0] == 1:
+                mock_df.collect.return_value = [entity_row]
+            elif call_count[0] == 2:
+                mock_df.collect.return_value = [col_row]
+            else:
+                mock_df.collect.return_value = []
+            return mock_df
+
+        validator.spark.sql.side_effect = sql_side_effect
+
+        success_row = MagicMock()
+        success_row.chunk_id = "0"
+        success_row.entity_ids = ["e1"]
+        success_row.response = json.dumps([{
+            "entity_id": "e1",
+            "is_valid": True,
+            "confidence_adjustment": 0.1,
+            "reasoning": "Correct",
+            "suggested_type": "",
+        }])
+
+        with patch.object(validator, '_run_ai_query_batch', return_value=([success_row], [])):
+            results, unvalidated = validator.validate_table_entities_batched()
+
+        assert len(results) == 1
+        assert results[0]["entity_id"] == "e1"
+        assert results[0]["validation_result"]["is_valid"] is True
+        assert unvalidated == []
+
+    def test_run_uses_batched_table_validation(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])) as mock_tbl, \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0) as mock_update, \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=0), \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            result = validator.run()
+            mock_tbl.assert_called_once()
+            mock_update.assert_called()
+            assert "table_entities_validated" in result
+
+
+class TestPruneInvalidEdges:
+    """Tests for prune_invalid_edges."""
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_prune_runs_delete(self, validator):
+        call_count = [0]
+        def sql_side_effect(query):
+            call_count[0] += 1
+            mock_df = MagicMock()
+            if "COUNT" in query and call_count[0] == 1:
+                mock_df.collect.return_value = [MagicMock(cnt=10)]
+            elif "DELETE" in query:
+                mock_df.collect.return_value = []
+            elif "COUNT" in query:
+                mock_df.collect.return_value = [MagicMock(cnt=7)]
+            return mock_df
+
+        validator.spark.sql.side_effect = sql_side_effect
+        pruned = validator.prune_invalid_edges()
+        assert pruned == 3
+
+    def test_prune_returns_zero_when_no_invalid(self, validator):
+        call_count = [0]
+        def sql_side_effect(query):
+            call_count[0] += 1
+            mock_df = MagicMock()
+            mock_df.collect.return_value = [MagicMock(cnt=5)]
+            return mock_df
+
+        validator.spark.sql.side_effect = sql_side_effect
+        pruned = validator.prune_invalid_edges()
+        assert pruned == 0
+
+    def test_prune_handles_missing_table(self, validator):
+        validator.spark.sql.side_effect = Exception("table not found")
+        pruned = validator.prune_invalid_edges()
+        assert pruned == 0
+
+    def test_run_calls_prune_and_includes_in_result(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])), \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0), \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=5) as mock_prune, \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            result = validator.run()
+            mock_prune.assert_called_once()
+            assert result["pruned_edges"] == 5
+
+
+class TestStoreEntitiesNonIncremental:
+    """Tests that _store_entities resets validated state when incremental=False."""
+
+    @pytest.fixture
+    def builder_incremental(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", incremental=True)
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            return OntologyBuilder(mock_spark, config)
+
+    @pytest.fixture
+    def builder_non_incremental(self):
+        mock_spark = MagicMock()
+        config = OntologyConfig(catalog_name="cat", schema_name="sch", incremental=False)
+        with patch.object(OntologyLoader, 'load_config') as mock_load:
+            mock_load.return_value = OntologyLoader._default_config()
+            return OntologyBuilder(mock_spark, config)
+
+    def _get_merge_sql(self, builder):
+        entities = [{"entity_id": "e1", "entity_type": "Patient", "source_tables": ["t1"], "confidence": 0.9}]
+        builder._store_entities(entities)
+        all_sql = [c[0][0] for c in builder.spark.sql.call_args_list]
+        merge_sqls = [s for s in all_sql if "MERGE INTO" in s]
+        assert len(merge_sqls) == 1
+        return merge_sqls[0]
+
+    def test_incremental_merge_uses_content_change_guard(self, builder_incremental):
+        sql = self._get_merge_sql(builder_incremental)
+        assert "target.confidence != source.confidence" in sql
+        assert "target.validated = FALSE," in sql.split("THEN UPDATE")[1]
+
+    def test_non_incremental_merge_uses_same_guard(self, builder_non_incremental):
+        """Both modes use the same content-change guard MERGE."""
+        sql = self._get_merge_sql(builder_non_incremental)
+        assert "auto_discovered = TRUE" in sql
+        assert "target.confidence != source.confidence" in sql
+
+    def test_non_incremental_merge_resets_validated_on_change(self, builder_non_incremental):
+        """Content change triggers validated + validation_notes reset."""
+        sql = self._get_merge_sql(builder_non_incremental)
+        update_clause = sql.split("THEN UPDATE")[1]
+        assert "target.validated = FALSE" in update_clause
+        assert "target.validation_notes = NULL" in update_clause
+
+
+class TestForceRevalidate:
+    """Tests for the force_revalidate parameter in OntologyValidator.run()."""
+
+    @pytest.fixture
+    def validator(self):
+        mock_spark = MagicMock()
+        config = OntologyValidatorConfig(catalog_name="cat", schema_name="sch")
+        return OntologyValidator(mock_spark, config)
+
+    def test_force_revalidate_runs_reset_update(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])), \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0), \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=0), \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            validator.run(force_revalidate=True)
+            all_sql = [c[0][0] for c in validator.spark.sql.call_args_list]
+            reset_sqls = [s for s in all_sql if "UPDATE" in s and "validated = FALSE" in s and "validated = TRUE" in s]
+            assert len(reset_sqls) == 1
+            assert "auto_discovered = TRUE" in reset_sqls[0]
+
+    def test_force_revalidate_false_skips_reset(self, validator):
+        with patch.object(validator, 'validate_table_entities_batched', return_value=([], [])), \
+             patch.object(validator, 'batch_update_entity_validation', return_value=0), \
+             patch.object(validator, 'check_consistency', return_value=[]), \
+             patch.object(validator, 'check_coverage', return_value=[]), \
+             patch.object(validator, 'validate_relationships', return_value=[]), \
+             patch.object(validator, 'prune_invalid_edges', return_value=0), \
+             patch.object(validator, 'generate_ontology_recommendations', return_value={}):
+            validator.run(force_revalidate=False)
+            all_sql = [c[0][0] for c in validator.spark.sql.call_args_list]
+            reset_sqls = [s for s in all_sql if "UPDATE" in s and "SET validated = FALSE" in s and "WHERE" in s]
+            assert len(reset_sqls) == 0
+
+    def test_validate_ontology_passes_force_revalidate(self):
+        with patch('dbxmetagen.ontology_validator.OntologyValidator') as MockClass:
+            mock_instance = MagicMock()
+            mock_instance.run.return_value = {"entities_validated": 0}
+            MockClass.return_value = mock_instance
+            from dbxmetagen.ontology_validator import validate_ontology
+            validate_ontology(
+                spark=MagicMock(), catalog_name="c", schema_name="s",
+                force_revalidate=True,
+            )
+            mock_instance.run.assert_called_once_with(
+                validate_columns=False, force_revalidate=True, table_names=None
+            )
+
+
+class TestEmitBundleEdges:
+    """Tests for OntologyBuilder.emit_bundle_edges()."""
+
+    @pytest.fixture
+    def builder(self, mock_spark):
+        config = MagicMock()
+        config.fully_qualified_entities = "cat.sch.ontology_entities"
+        config.fully_qualified_relationships = "cat.sch.ontology_relationships"
+        config.catalog_name = "cat"
+        config.schema_name = "sch"
+
+        mock_loader = MagicMock()
+        mock_loader.has_tier_indexes = True
+        mock_loader.get_edges_tier1.return_value = [
+            {"name": "treats", "domain": "Medication", "range": "Condition", "cardinality": "one-to-many"},
+            {"name": "prescribes", "domain": "Practitioner", "range": "Medication", "cardinality": "one-to-many"},
+            {"name": "has_encounter", "domain": "Patient", "range": "Encounter", "cardinality": "one-to-many"},
+        ]
+
+        with patch('dbxmetagen.ontology.OntologyLoader') as MockOntLoader, \
+             patch('dbxmetagen.ontology.EntityDiscoverer') as MockDisc, \
+             patch('dbxmetagen.ontology.load_domain_entity_affinity', return_value={}):
+            MockOntLoader.load_config.return_value = {"ontology": {"version": "1.0"}}
+            disc_instance = MockDisc.return_value
+            disc_instance._get_index_loader.return_value = mock_loader
+            disc_instance.entity_definitions = []
+
+            from dbxmetagen.ontology import OntologyBuilder
+            b = OntologyBuilder(mock_spark, config)
+            b.discoverer = disc_instance
+            # Real (empty) catalog by default so the root-YAML catalog-fallback
+            # loop in emit_bundle_edges iterates a real dict, not a MagicMock.
+            disc_instance._edge_catalog = EdgeCatalog({})
+            yield b
+
+    def test_emits_edges_for_matching_entity_pairs(self, builder):
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        discovered = [Row(entity_type="Medication"), Row(entity_type="Condition"), Row(entity_type="Patient")]
+        builder.spark.sql.return_value.collect.return_value = discovered
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+        builder.discoverer._get_index_loader.return_value._load.return_value = {}
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        df_data = builder.spark.createDataFrame.call_args[0][0]
+        assert len(df_data) == 1
+        row = df_data[0]
+        assert row["src_entity_type"] == "Medication"
+        assert row["dst_entity_type"] == "Condition"
+        assert row["relationship_name"] == "treats"
+        assert row["cardinality"] == "one-to-many"
+        assert row["source"] == "bundle"
+        assert row["confidence"] == 0.8
+        assert row["evidence_column"] is None
+        assert row["evidence_table"] is None
+        assert "relationship_id" in row
+
+        merge_calls = [c for c in builder.spark.sql.call_args_list if "MERGE INTO" in str(c)]
+        assert len(merge_calls) == 1
+
+    def test_skips_when_no_loader(self, builder):
+        builder.discoverer._get_index_loader.return_value = None
+        assert builder.emit_bundle_edges() == 0
+
+    def test_skips_when_no_discovered_entities(self, builder):
+        builder.spark.sql.return_value.collect.return_value = []
+        builder.discoverer._get_index_loader.return_value._load.return_value = {}
+        assert builder.emit_bundle_edges() == 0
+
+    def test_reference_resolution_resolves_from_property_name(self, builder):
+        """Edge with range='Reference' resolved via property name suffix."""
+        from dbxmetagen.ontology import OntologyBuilder
+
+        loader = builder.discoverer._get_index_loader.return_value
+        loader.get_edges_tier1.return_value = [
+            {"name": "Patient.managingOrganization", "domain": "Patient", "range": "Reference", "cardinality": "one-to-one"},
+        ]
+        loader._load.return_value = {}
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Patient"), Row(entity_type="Organization"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        df_data = builder.spark.createDataFrame.call_args[0][0]
+        row = df_data[0]
+        assert row["src_entity_type"] == "Patient"
+        assert row["dst_entity_type"] == "Organization"
+        assert row["relationship_name"] == "Patient.managingOrganization"
+        assert row["cardinality"] == "one-to-one"
+        assert row["source"] == "bundle"
+
+    def test_multi_range_fallback(self, builder):
+        """Edge with non-discovered primary range falls back to tier-2 ranges list."""
+        loader = builder.discoverer._get_index_loader.return_value
+        loader.get_edges_tier1.return_value = [
+            {"name": "subject", "domain": "Observation", "range": "Resource", "cardinality": "one-to-one"},
+        ]
+        loader._load.return_value = {
+            "subject": {"name": "subject", "domain": "Observation", "range": "Resource",
+                        "ranges": ["Resource", "Patient", "Group"]},
+        }
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Observation"), Row(entity_type="Patient"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        df_data = builder.spark.createDataFrame.call_args[0][0]
+        assert df_data[0]["dst_entity_type"] == "Patient"
+
+    def test_reference_resolution_skips_ambiguous(self, builder):
+        """Reference resolution skips when multiple entity types match the suffix."""
+        from dbxmetagen.ontology import OntologyBuilder
+
+        # "suborganization" ends with both "organization" and "suborganization"
+        result = OntologyBuilder._resolve_reference_target(
+            "Patient.subOrganization", {"organization": "Organization", "suborganization": "SubOrganization"}
+        )
+        assert result is None
+
+    def test_root_yaml_fallback_emits_edges_without_tiers(self, builder):
+        """When tier indexes are absent, edges are derived from entity definitions."""
+        from dbxmetagen.ontology import EntityDefinition
+
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = [
+            EntityDefinition(
+                name="Device", description="",
+                relationships={"has_sensor": {"target": "Sensor", "cardinality": "one-to-many"}},
+            ),
+            EntityDefinition(name="Sensor", description="", relationships={}),
+        ]
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Device"), Row(entity_type="Sensor"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        df_data = builder.spark.createDataFrame.call_args[0][0]
+        assert len(df_data) == 1
+        row = df_data[0]
+        assert row["src_entity_type"] == "Device"
+        assert row["dst_entity_type"] == "Sensor"
+        assert row["relationship_name"] == "has_sensor"
+        assert row["source"] == "bundle"
+        assert row["confidence"] == 0.8
+
+    def test_root_yaml_fallback_skips_undiscovered_targets(self, builder):
+        """Fallback only emits edges where both entity types are discovered."""
+        from dbxmetagen.ontology import EntityDefinition
+
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = [
+            EntityDefinition(
+                name="Device", description="",
+                relationships={
+                    "has_sensor": {"target": "Sensor", "cardinality": "one-to-many"},
+                    "has_alert": {"target": "Alert", "cardinality": "one-to-many"},
+                },
+            ),
+            EntityDefinition(name="Sensor", description="", relationships={}),
+        ]
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Device"), Row(entity_type="Sensor"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        df_data = builder.spark.createDataFrame.call_args[0][0]
+        assert len(df_data) == 1
+        assert df_data[0]["relationship_name"] == "has_sensor"
+
+    def test_root_yaml_fallback_returns_zero_with_no_entity_defs(self, builder):
+        """Fallback with empty entity_definitions still returns 0."""
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = []
+        builder.discoverer._edge_catalog = EdgeCatalog({})
+        assert builder.emit_bundle_edges() == 0
+
+    def test_root_yaml_fallback_emits_catalog_edges_not_wired_per_entity(self, builder):
+        """Concrete edge_catalog entries emit even when no entity wires them."""
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = []
+        builder.discoverer._edge_catalog = EdgeCatalog({
+            "employs": EdgeCatalogEntry(
+                name="employs", domain="Organization", range="Person", category="business",
+            ),
+        })
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Organization"), Row(entity_type="Person"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        row = builder.spark.createDataFrame.call_args[0][0][0]
+        assert row["src_entity_type"] == "Organization"
+        assert row["dst_entity_type"] == "Person"
+        assert row["relationship_name"] == "employs"
+        assert row["source"] == "bundle"
+
+    def test_root_yaml_fallback_skips_structural_and_unconstrained_catalog(self, builder):
+        """Structural and Any->Any catalog entries are not emitted."""
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = []
+        builder.discoverer._edge_catalog = EdgeCatalog({
+            "subclass_of": EdgeCatalogEntry(
+                name="subclass_of", domain="Person", range="Organization", category="structural",
+            ),
+            "references": EdgeCatalogEntry(
+                name="references", domain="Any", range="Any", category="business",
+            ),
+        })
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Person"), Row(entity_type="Organization"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        assert builder.emit_bundle_edges() == 0
+
+    def test_root_yaml_per_entity_and_catalog_dedup(self, builder):
+        """An edge present in both per-entity and catalog emits exactly once."""
+        from dbxmetagen.ontology import EntityDefinition
+
+        builder.discoverer._get_index_loader.return_value = None
+        builder.discoverer.entity_definitions = [
+            EntityDefinition(
+                name="Organization", description="",
+                relationships={"employs": {"target": "Person", "cardinality": "one-to-many"}},
+            ),
+            EntityDefinition(name="Person", description="", relationships={}),
+        ]
+        builder.discoverer._edge_catalog = EdgeCatalog({
+            "employs": EdgeCatalogEntry(
+                name="employs", domain="Organization", range="Person", category="business",
+            ),
+        })
+
+        Row = type("Row", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+        builder.spark.sql.return_value.collect.return_value = [
+            Row(entity_type="Organization"), Row(entity_type="Person"),
+        ]
+        builder.spark.createDataFrame = MagicMock()
+        builder.spark.catalog = MagicMock()
+
+        result = builder.emit_bundle_edges()
+        assert result == 1
+        assert len(builder.spark.createDataFrame.call_args[0][0]) == 1
+
+
+class TestBuildTiersEnrichedSchema:
+    """Verify build_tiers outputs label on entities and cardinality on edges."""
+
+    def test_tier1_has_label_and_edge_has_cardinality(self):
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from dbxmetagen.ontology_bundle_indexes import build_tiers
+
+        entities = {
+            "Patient": {
+                "description": "Patient record",
+                "label": "Patient Resource",
+                "source": "FHIR R4",
+                "uri": "http://hl7.org/fhir/Patient",
+                "parents": [],
+                "outgoing_edges": [{"name": "hasEncounter", "uri": "", "range": "Encounter", "ranges": [], "inverse": None}],
+                "keywords": ["patient"],
+                "synonyms": [],
+                "typical_attributes": [],
+                "business_questions": [],
+                "relationships": {"hasEncounter": {"target": "Encounter", "cardinality": "one-to-many"}},
+                "properties": {},
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            build_tiers(entities, Path(tmp))
+            t1 = _json.loads((Path(tmp) / "entities_tier1.json").read_text())
+            assert t1[0]["label"] == "Patient Resource"
+            e1 = _json.loads((Path(tmp) / "edges_tier1.json").read_text())
+            assert e1[0]["cardinality"] == "one-to-many"
+
+    def test_edge_tiers_include_label_and_facet(self):
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from dbxmetagen.ontology_bundle_indexes import build_tiers
+
+        entities = {
+            "Encounter": {
+                "description": "An encounter",
+                "label": "Encounter",
+                "source": "FHIR R4",
+                "uri": "http://hl7.org/fhir/Encounter",
+                "parents": [],
+                "outgoing_edges": [{
+                    "name": "subject", "uri": "", "range": "Patient",
+                    "ranges": ["Patient"], "inverse": None,
+                    "label": "Subject", "facet": "who",
+                }],
+                "keywords": [],
+                "synonyms": [],
+                "typical_attributes": [],
+                "business_questions": [],
+                "relationships": {"subject": {"target": "Patient", "cardinality": "one-to-one"}},
+                "properties": {},
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            build_tiers(entities, Path(tmp))
+            e1 = _json.loads((Path(tmp) / "edges_tier1.json").read_text())
+            assert e1[0]["label"] == "Subject"
+            assert e1[0]["facet"] == "who"
+            e3 = _json.loads((Path(tmp) / "edges_tier3.json").read_text())
+            assert e3["subject"]["facet"] == "who"
+            assert e3["subject"]["category"] == "who"
+
+            e1_yaml = yaml.safe_load((Path(tmp) / "edges_tier1.yaml").read_text())
+            assert e1_yaml[0]["label"] == "Subject"
+            assert e1_yaml[0]["facet"] == "who"
+
+
+class TestDualFormatLoader:
+    """Verify OntologyIndexLoader prefers JSON over YAML."""
+
+    def test_loads_json_when_both_exist(self):
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from dbxmetagen.ontology_index import OntologyIndexLoader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            yaml.dump([{"name": "A", "description": "from yaml"}], (d / "entities_tier1.yaml").open("w"))
+            _json.dump([{"name": "B", "description": "from json"}], (d / "entities_tier1.json").open("w"))
+            loader = OntologyIndexLoader(base_dir=str(d))
+            assert loader.has_tier_indexes
+            result = loader.get_entities_tier1()
+            assert result[0]["name"] == "B"
+
+    def test_falls_back_to_yaml(self):
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from dbxmetagen.ontology_index import OntologyIndexLoader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            yaml.dump([{"name": "C", "description": "yaml only"}], (d / "entities_tier1.yaml").open("w"))
+            loader = OntologyIndexLoader(base_dir=str(d))
+            assert loader.has_tier_indexes
+            result = loader.get_entities_tier1()
+            assert result[0]["name"] == "C"
+
+    def test_edge_tier_prefers_json(self):
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from dbxmetagen.ontology_index import OntologyIndexLoader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            yaml.dump([{"name": "E", "description": "ent"}], (d / "entities_tier1.yaml").open("w"))
+            yaml.dump([{"name": "old_edge", "domain": "A", "range": "B"}],
+                      (d / "edges_tier1.yaml").open("w"))
+            _json.dump([{"name": "new_edge", "domain": "X", "range": "Y"}],
+                       (d / "edges_tier1.json").open("w"))
+            loader = OntologyIndexLoader(base_dir=str(d))
+            edges = loader.get_edges_tier1()
+            assert edges[0]["name"] == "new_edge"
+
+
+class TestEntitiesFromBundleFidelity:
+    """North-star tests: curated bundle metadata should flow through the pipeline."""
+
+    def test_bundle_relationship_label_propagates_to_outgoing_edges(self):
+        """Curated bundle labels on relationships should survive into outgoing_edges.
+
+        Currently entities_from_bundle() builds outgoing_edges with only name, uri,
+        range, inverse. The 'label' field from a bundle's relationship definition is
+        silently dropped. When curated bundles provide display labels (which they
+        should for non-OWL ontologies like general, financial_services, retail_cpg),
+        those labels must flow into outgoing_edges so build_tiers() can propagate
+        them to edge tier files for LLM context.
+        """
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from dbxmetagen.ontology_bundle_indexes import entities_from_bundle
+
+        bundle = {
+            "ontology": {
+                "entities": {"definitions": {
+                    "Patient": {
+                        "description": "A patient",
+                        "keywords": ["patient"],
+                        "relationships": {
+                            "managingOrganization": {
+                                "target": "Organization",
+                                "cardinality": "one-to-one",
+                                "label": "Managing Organization",
+                            }
+                        },
+                    }
+                }},
+                "edge_catalog": {},
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "test_bundle.yaml"
+            yaml.dump(bundle, p.open("w"), default_flow_style=False)
+            entities = entities_from_bundle(p)
+
+        edge = entities["Patient"]["outgoing_edges"][0]
+        assert edge.get("label") == "Managing Organization"
+
+
+class TestEdgeTierSemanticCompleteness:
+    """North-star tests: W5 semantic annotations should survive into edge tier files."""
+
+    def test_sub_property_of_preserved_in_edge_tier2(self):
+        """W5 sub-property-of hierarchy should survive into edges_tier2 for LLM context.
+
+        Currently build_tiers() copies label and facet from outgoing_edges into
+        all_edges, but does NOT copy sub_property_of. This means the W5 semantic
+        classification (e.g. ["who.focus"]) extracted by _extract_single_class()
+        is lost when building tier-2 edge files. Downstream consumers (like LLM
+        prompts in predict_edge()) that read tier-2/3 edges never see the W5 path.
+        """
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from dbxmetagen.ontology_bundle_indexes import build_tiers
+
+        entities = {
+            "Encounter": {
+                "description": "An encounter",
+                "label": "Encounter",
+                "source": "FHIR R4",
+                "uri": "http://hl7.org/fhir/Encounter",
+                "parents": [],
+                "outgoing_edges": [{
+                    "name": "subject", "uri": "", "range": "Patient",
+                    "ranges": ["Patient"], "inverse": None,
+                    "label": "Subject", "facet": "who",
+                    "sub_property_of": ["who.focus"],
+                }],
+                "keywords": [],
+                "synonyms": [],
+                "typical_attributes": [],
+                "business_questions": [],
+                "relationships": {"subject": {"target": "Patient", "cardinality": "one-to-one"}},
+                "properties": {},
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            build_tiers(entities, Path(tmp))
+            e2 = _json.loads((Path(tmp) / "edges_tier2.json").read_text())
+            assert e2["subject"]["sub_property_of"] == ["who.focus"]
+
+
+class TestEntitiesFromBundleStringRelationship:
+    """entities_from_bundle must handle shorthand string relationships."""
+
+    def test_string_relationship_produces_entity_with_target(self):
+        import yaml as _yaml
+        from dbxmetagen.ontology_bundle_indexes import entities_from_bundle
+        bundle = {
+            "ontology": {
+                "entities": {
+                    "definitions": {
+                        "Patient": {
+                            "description": "A patient",
+                            "relationships": {
+                                "managingOrganization": "Organization",
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "bundle.yaml"
+            p.write_text(_yaml.dump(bundle))
+            result = entities_from_bundle(p)
+        pat = result["Patient"]
+        edge_names = [e["name"] for e in pat["outgoing_edges"]]
+        assert "managingOrganization" in edge_names
+        edge = next(e for e in pat["outgoing_edges"] if e["name"] == "managingOrganization")
+        assert edge["range"] == "Organization"
+
+
+class TestParseTierFileJsonFallback:
+    """_parse_tier_file must fall back to YAML sibling on corrupt JSON."""
+
+    def test_corrupt_json_falls_back_to_yaml(self):
+        import yaml as _yaml
+        from dbxmetagen.ontology_index import _parse_tier_file
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "entities_tier1.json"
+            yaml_path = Path(tmp) / "entities_tier1.yaml"
+            json_path.write_text("{corrupt json!!!", encoding="utf-8")
+            yaml_path.write_text(_yaml.dump({"Patient": {"desc": "ok"}}), encoding="utf-8")
+            result = _parse_tier_file(json_path)
+        assert result == {"Patient": {"desc": "ok"}}
+
+    def test_corrupt_json_no_yaml_sibling_raises(self):
+        from dbxmetagen.ontology_index import _parse_tier_file
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "entities_tier1.json"
+            json_path.write_text("{corrupt json!!!", encoding="utf-8")
+            with pytest.raises(json.JSONDecodeError):
+                _parse_tier_file(json_path)
+
+
+class TestGetUriCaseInsensitive:
+    """get_uri must perform case-insensitive entity name lookup."""
+
+    def test_lowercase_input_matches_titlecase_key(self):
+        from dbxmetagen.ontology_index import OntologyIndexLoader
+        loader = OntologyIndexLoader.__new__(OntologyIndexLoader)
+        loader._cache = {}
+        loader.bundle_dir = None
+        uri_data = {"Patient": "http://hl7.org/fhir/Patient"}
+        with patch.object(loader, "_load", return_value=uri_data):
+            assert loader.get_uri("patient") == "http://hl7.org/fhir/Patient"
+
+    def test_exact_case_still_works(self):
+        from dbxmetagen.ontology_index import OntologyIndexLoader
+        loader = OntologyIndexLoader.__new__(OntologyIndexLoader)
+        loader._cache = {}
+        loader.bundle_dir = None
+        uri_data = {"Patient": "http://hl7.org/fhir/Patient"}
+        with patch.object(loader, "_load", return_value=uri_data):
+            assert loader.get_uri("Patient") == "http://hl7.org/fhir/Patient"
+
+
+class TestResolveOntologyConfigPath:
+    """Tests for _resolve_ontology_config_path auto-derive logic."""
+
+    def test_default_config_derives_from_bundle(self):
+        result = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "general",
+        )
+        assert result == "configurations/ontology_bundles/general.yaml"
+
+    def test_explicit_override_wins(self):
+        result = _resolve_ontology_config_path(
+            "custom/path.yaml", "general",
+        )
+        assert result == "custom/path.yaml"
+
+    def test_empty_bundle_keeps_default(self):
+        result = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "",
+        )
+        assert result == _DEFAULT_ONTOLOGY_CONFIG_PATH
+
+    def test_healthcare_bundle_derives_correctly(self):
+        result = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "healthcare",
+        )
+        assert result == "configurations/ontology_bundles/healthcare.yaml"
+
+    def test_formal_bundle_derives_correctly(self):
+        result = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "fhir_r4",
+        )
+        assert result == "configurations/ontology_bundles/fhir_r4.yaml"
+
+
+class TestOntologyConfigPathDerivation:
+    """Integration tests verifying that OntologyLoader.load_config
+    succeeds with derived bundle paths for real bundle files."""
+
+    def test_general_bundle_loads_general_entities(self):
+        path = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "general",
+        )
+        config = OntologyLoader.load_config(path)
+        defs = config.get("entities", {}).get("definitions", {})
+        assert "Person" in defs
+        assert "Organization" in defs
+        assert "Patient" not in defs
+
+    def test_healthcare_bundle_loads_healthcare_entities(self):
+        path = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "healthcare",
+        )
+        config = OntologyLoader.load_config(path)
+        defs = config.get("entities", {}).get("definitions", {})
+        assert "Patient" in defs
+        assert "Provider" in defs
+
+    def test_fhir_bundle_loads_with_validation(self):
+        path = _resolve_ontology_config_path(
+            _DEFAULT_ONTOLOGY_CONFIG_PATH, "fhir_r4",
+        )
+        config = OntologyLoader.load_config(path)
+        defs = config.get("entities", {}).get("definitions", {})
+        assert len(defs) > 50
+        validation = config.get("validation", {})
+        assert validation.get("ai_validation_enabled") is True
+
+
+def _make_builder():
+    """Build an OntologyBuilder with mocked Spark and default config."""
+    mock_spark = MagicMock()
+    config = OntologyConfig(catalog_name="cat", schema_name="sch")
+    with patch.object(OntologyLoader, "load_config") as mock_load:
+        mock_load.return_value = OntologyLoader._default_config()
+        return OntologyBuilder(mock_spark, config)
+
+
+class TestGranularityDowngradeFix:
+    """Fix 1a: the column-store MERGE must preserve table-level granularity."""
+
+    def test_merge_preserves_table_granularity(self):
+        builder = _make_builder()
+        entities = [{
+            "entity_id": "e1", "entity_name": "Patient", "entity_type": "Patient",
+            "source_tables": ["t1"], "confidence": 0.9,
+            "attributes": {"granularity": "column", "discovery_method": "column_keyword"},
+        }]
+        builder._store_entities(entities)
+        merge_sql = [c[0][0] for c in builder.spark.sql.call_args_list if "MERGE INTO" in c[0][0]][0]
+        # Dedup-safe attribute merge that keeps granularity='table' on collision.
+        assert "map_filter(source.attributes" in merge_sql
+        assert "'granularity', 'table'" in merge_sql
+        assert "source.attributes['granularity'] = 'column'" in merge_sql
+
+
+class TestOwnershipPenaltyFix:
+    """Fix 1b: classify_entity_roles deprioritizes ubiquitous owned column entities."""
+
+    def test_classify_roles_sql_has_ownership_penalty(self):
+        builder = _make_builder()
+        builder.spark.sql.return_value.collect.return_value = []
+        builder.classify_entity_roles()
+        merge_sql = [c[0][0] for c in builder.spark.sql.call_args_list if "ent_agg" in c[0][0]]
+        assert merge_sql, "expected ownership-penalty MERGE with ent_agg CTE"
+        sql = merge_sql[0]
+        assert "column_table_count" in sql
+        assert ">= 4" in sql
+        assert "BOOL_OR(granularity = 'table') AS owned" in sql
+        # Penalty must not demote human-created (auto_discovered=FALSE) entities.
+        assert "e.auto_discovered" in sql
+
+
+class TestAbstainFloorFix:
+    """Fix 3: low-confidence primaries are flagged and lose their instance_of edge."""
+
+    def test_flag_low_confidence_primaries_sql(self):
+        builder = _make_builder()
+        builder._flag_low_confidence_primaries()
+        upd = [c[0][0] for c in builder.spark.sql.call_args_list
+               if "needs_human_review" in c[0][0] and "UPDATE" in c[0][0]][0]
+        assert "0.3" in upd
+        assert "map_filter(attributes" in upd
+        assert "entity_role" in upd
+        # Human-locked / validated entities must never be auto-flagged.
+        assert "COALESCE(auto_discovered, TRUE) = TRUE" in upd
+        assert "COALESCE(validated, FALSE) = FALSE" in upd
+
+    def test_instance_of_edge_respects_floor(self):
+        builder = _make_builder()
+        try:
+            builder._build_structural_edges()
+        except Exception:
+            pass
+        inst = [c[0][0] for c in builder.spark.sql.call_args_list if "canonical_dst" in c[0][0]]
+        assert inst, "expected instance_of edge query"
+        sql = inst[0]
+        assert "COALESCE(confidence, 1.0) >=" in sql
+        assert "needs_human_review" in sql
+        # Validated / human-locked primaries keep their edge regardless of score.
+        assert "COALESCE(validated, FALSE) = TRUE" in sql
+        assert "COALESCE(auto_discovered, TRUE) = FALSE" in sql
+
+
+def _make_builder_with_config(definitions, bundle=""):
+    """Build an OntologyBuilder whose loaded config carries the given entity
+    definitions and ontology_bundle (for concept-seeding/hierarchy-edge tests)."""
+    mock_spark = MagicMock()
+    config = OntologyConfig(catalog_name="cat", schema_name="sch", ontology_bundle=bundle)
+    base = OntologyLoader._default_config()
+    base.setdefault("entities", {})["definitions"] = definitions
+    with patch.object(OntologyLoader, "load_config", return_value=base):
+        return OntologyBuilder(mock_spark, config)
+
+
+def _entity_delete_sql(builder):
+    """Return the single DELETE statement against ontology_entities (excludes node deletes)."""
+    sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+    deletes = [
+        s for s in sql_calls
+        if s.lstrip().startswith("DELETE FROM") and "ontology_entities" in s
+        and "node_type" not in s
+    ]
+    assert len(deletes) == 1
+    return deletes[0]
+
+
+class TestSeedConceptParentEntities:
+    """Fix 2b: seed undiscovered ancestor types as abstract concept rows.
+
+    Parents come from the bundle YAML (data-driven); seeding only inserts
+    ancestors referenced by discovered entities but never discovered themselves.
+    """
+
+    def test_seeds_ancestor_closure_insert_only(self):
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {
+                "Patient": {"parents": ["DomainResource"]},
+                "Encounter": {"parents": ["DomainResource"]},
+                "DomainResource": {"parents": ["Resource"]},
+            },
+            bundle="fhir_r4",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="Patient"),
+            SimpleNamespace(entity_type="Encounter"),
+        ]
+        n = builder._seed_concept_parent_entities()
+        assert n == 2
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        assert {r[1] for r in rows} == {"DomainResource", "Resource"}
+        for r in rows:
+            assert r[4] == []          # source_tables empty
+            assert r[8] is True        # auto_discovered
+            assert r[9] is False       # validated
+            assert r[11] == "referenced"
+        merge = [c[0][0] for c in builder.spark.sql.call_args_list if "MERGE INTO" in c[0][0]][0]
+        assert "WHEN NOT MATCHED THEN INSERT" in merge
+        assert "WHEN MATCHED" not in merge
+
+    def test_primitive_ancestors_are_not_seeded(self):
+        # Primitive datatype names (Number, etc.) are schema.org DataTypes, not semantic
+        # ancestors -- they must be filtered from the seed set (mirrors the discovered filter).
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {
+                "Quantity": {"parents": ["Number", "StructuredValue"]},
+                "StructuredValue": {"description": "sv"},
+            },
+            bundle="schema_org",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="Quantity"),
+        ]
+        builder._seed_concept_parent_entities()
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        names = {r[1] for r in rows}
+        assert "Number" not in names
+        assert "StructuredValue" in names
+
+    def test_no_seed_when_all_ancestors_discovered(self):
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {"A": {"parents": ["B"]}, "B": {"description": "b"}}, bundle="",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="A"), SimpleNamespace(entity_type="B"),
+        ]
+        assert builder._seed_concept_parent_entities() == 0
+        builder.spark.createDataFrame.assert_not_called()
+
+    def test_hierarchy_edges_form_to_seeded_roots(self):
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {
+                "Patient": {"parents": ["DomainResource"]},
+                "DomainResource": {"parents": ["Resource"]},
+                "Resource": {"description": "r"},
+            },
+            bundle="fhir_r4",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type=t) for t in ("Patient", "DomainResource", "Resource")
+        ]
+        builder._build_hierarchy_edges()
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        pairs = {(r[0], r[1]) for r in rows}
+        assert ("entity::fhir_r4::Patient", "entity::fhir_r4::DomainResource") in pairs
+        assert ("entity::fhir_r4::DomainResource", "entity::fhir_r4::Resource") in pairs
+
+    def test_subclass_of_field_builds_is_a_edge(self):
+        # _build_hierarchy_edges must honour `subclass_of` (alignment fix), not
+        # just `parent`/`parents`.
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {"Order": {"subclass_of": "Transaction"}, "Transaction": {"description": "t"}},
+            bundle="",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="Order"), SimpleNamespace(entity_type="Transaction"),
+        ]
+        builder._build_hierarchy_edges()
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        pairs = {(r[0], r[1]) for r in rows}
+        assert ("entity::_default::Order", "entity::_default::Transaction") in pairs
+
+    def test_seeds_category_nodes_with_category_granularity(self):
+        # W5 categories live in a separate `categories` field and are seeded as
+        # concept nodes (granularity='category'), distinct from is_a ancestors.
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {
+                "Patient": {"parents": ["DomainResource"], "categories": ["administrative.individual"]},
+                "DomainResource": {"description": "abstract"},
+            },
+            bundle="fhir_r4",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="Patient"),
+            SimpleNamespace(entity_type="DomainResource"),
+        ]
+        n = builder._seed_concept_parent_entities()
+        assert n == 1
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        assert {r[1] for r in rows} == {"administrative.individual"}
+        # granularity marker is in attributes (index 6)
+        assert rows[0][6]["granularity"] == "category"
+
+
+class TestCategoryEdges:
+    """Fix 2b: W5 categories become categorized_as edges, separate from is_a."""
+
+    def test_build_category_edges_from_categories_field(self):
+        from types import SimpleNamespace
+        builder = _make_builder_with_config(
+            {
+                "Patient": {"categories": ["administrative.individual"]},
+                "administrative.individual": {"description": "w5 group"},
+            },
+            bundle="fhir_r4",
+        )
+        builder.spark.sql.return_value.collect.return_value = [
+            SimpleNamespace(entity_type="Patient"),
+            SimpleNamespace(entity_type="administrative.individual"),
+        ]
+        builder._build_category_edges()
+        rows = builder.spark.createDataFrame.call_args[0][0]
+        assert len(rows) == 1
+        s, d, rel = rows[0][0], rows[0][1], rows[0][2]
+        assert s == "entity::fhir_r4::Patient"
+        assert d == "entity::fhir_r4::administrative.individual"
+        assert rel == "categorized_as"
+
+    def test_no_category_edges_when_no_categories(self):
+        builder = _make_builder_with_config({"Patient": {"parents": ["DomainResource"]}}, bundle="fhir_r4")
+        assert builder._build_category_edges() is None
+        builder.spark.createDataFrame.assert_not_called()
+
+
+class TestCoexistenceInvariants:
+    """Guard tests for the multi-bundle coexistence invariant (ontology-patterns.mdc).
+
+    These fail loudly if a future change reintroduces a bundle purge or makes the default
+    (no-sweep) path delete entities."""
+
+    def test_store_entities_is_additive_no_delete(self):
+        import inspect
+        src = inspect.getsource(OntologyBuilder._store_entities)
+        assert "DELETE FROM" not in src.upper()
+        assert "NOT MATCHED BY SOURCE" not in src.upper()
+
+    def test_table_scope_deletion_is_bundle_agnostic(self):
+        # Table-attributed deletion is a table operation, never a bundle operation.
+        # The ONLY bundle filter allowed is the table-less seed branch, which must always
+        # be co-located with an empty-source_tables guard.
+        builder = _make_builder_with_config({}, bundle="schema_org")
+        builder._purge_entities_for_rebuild(["cat.sch.patients"])
+        ed = _entity_delete_sql(builder)
+        if "ontology_bundle" in ed:
+            assert "cardinality(source_tables) = 0" in ed
+
+    def test_refresh_relationships_never_deletes_entities(self):
+        import inspect
+        src = inspect.getsource(OntologyBuilder.refresh_relationships)
+        assert "_purge_entities_for_rebuild" not in src
+        assert "_purge_foreign_bundle_entities" not in src
+
+
+class TestPurgeEntitiesForRebuild:
+    """Table-scoped, bundle-agnostic entity refresh used by an explicit sweep run.
+
+    Refreshes only the tables in scope (any bundle on those tables); tables not in scope are
+    untouched so other bundles coexist. Steward locks (auto_discovered=FALSE) are preserved."""
+
+    def _entity_delete(self, builder):
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        deletes = [
+            s for s in sql_calls
+            if s.lstrip().startswith("DELETE FROM") and "ontology_entities" in s
+            and "node_type" not in s
+        ]
+        assert len(deletes) == 1
+        return deletes[0]
+
+    def test_full_schema_purge_is_bundle_agnostic(self):
+        builder = _make_builder_with_config({}, bundle="omop_cdm")
+        builder._purge_entities_for_rebuild(None)
+        ed = self._entity_delete(builder)
+        # No bundle filter -- a sweep is a table refresh, not a bundle operation
+        assert "ontology_bundle" not in ed
+        # Steward overrides preserved
+        assert "COALESCE(auto_discovered, TRUE) = TRUE" in ed
+        # No table-scope clause when table_names is empty (all tables in scope)
+        assert "source_tables" not in ed
+
+    def test_scoped_purge_filters_by_source_tables(self):
+        builder = _make_builder_with_config({}, bundle="omop_cdm")
+        builder._purge_entities_for_rebuild(["cat.sch.patients"])
+        ed = self._entity_delete(builder)
+        assert "exists(source_tables, x -> x IN ('cat.sch.patients'))" in ed
+        assert "COALESCE(auto_discovered, TRUE) = TRUE" in ed
+
+    def test_scoped_purge_refreshes_current_bundle_seeds(self):
+        # Table-less seeds (empty source_tables) can't be matched by a table scope, so a scoped
+        # purge also deletes the CURRENT bundle's table-less seeds (OR'd with the table scope).
+        builder = _make_builder_with_config({}, bundle="schema_org")
+        builder._purge_entities_for_rebuild(["cat.sch.patients"])
+        ed = self._entity_delete(builder)
+        assert "cardinality(source_tables) = 0" in ed
+        assert "COALESCE(ontology_bundle, '') = 'schema_org'" in ed
+        assert "exists(source_tables, x -> x IN ('cat.sch.patients'))" in ed
+        assert " OR " in ed
+
+    def test_deletes_orphan_entity_nodes_via_canonical_id_antijoin(self):
+        builder = _make_builder_with_config({}, bundle="omop_cdm")
+        builder._purge_entities_for_rebuild(None)
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        node_deletes = [
+            s for s in sql_calls
+            if s.lstrip().startswith("DELETE FROM") and "node_type = 'entity'" in s
+        ]
+        assert len(node_deletes) == 1
+        nd = node_deletes[0]
+        assert "source_system = 'ontology'" in nd
+        assert OntologyBuilder.CANONICAL_ID_SQL in nd
+        assert "NOT IN" in nd
+
+    def test_escapes_table_names(self):
+        builder = _make_builder_with_config({}, bundle="omop_cdm")
+        builder._purge_entities_for_rebuild(["cat.sch.o'brien"])
+        sql_calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        assert any("o''brien" in s for s in sql_calls)
+
+
+class TestRefreshRelationshipsSweepThreading:
+    """sweep_stale_entities must thread through and imply the edge sweep."""
+
+    def test_convenience_fn_forwards_sweep_stale_entities(self):
+        with patch("dbxmetagen.ontology.OntologyBuilder") as MockBuilder:
+            instance = MockBuilder.return_value
+            instance.refresh_relationships.return_value = {}
+            from dbxmetagen.ontology import refresh_ontology_relationships
+            refresh_ontology_relationships(
+                MagicMock(), "cat", "sch",
+                sweep_stale=False, sweep_stale_entities=True, incremental=False,
+            )
+            instance.refresh_relationships.assert_called_once_with(
+                sweep_stale=False, sweep_stale_entities=True, incremental=False,
+            )
+
+
+class TestRunCleanRebuildPurge:
+    """run() triggers the table-scoped sweep refresh only on non-incremental + sweep_stale_entities."""
+
+    _STUB_METHODS = [
+        "create_entities_table", "create_metrics_table",
+        "discover_and_store_entities", "discover_and_store_column_entities",
+        "backfill_source_columns", "classify_entity_roles", "_deduplicate_primary_entities",
+        "_flag_low_confidence_primaries", "classify_column_properties",
+        "validate_entity_conformance", "discover_named_relationships", "emit_bundle_edges",
+        "_seed_concept_parent_entities", "_sync_entity_nodes_to_graph",
+        "_enrich_table_nodes_with_ontology", "validate_ontology_completeness",
+        "compute_ontology_metrics", "apply_entity_tags", "_get_bundle_version",
+        "_store_discovery_diff", "_serialize_turtle",
+    ]
+
+    def _builder(self, incremental):
+        b = _make_builder_with_config({}, bundle="schema_org")
+        b.config.incremental = incremental
+        for name in self._STUB_METHODS:
+            setattr(b, name, MagicMock(return_value=0))
+        b._snapshot_ontology_state = MagicMock(return_value={})
+        b.discover_inter_entity_relationships = MagicMock(return_value={})
+        for edge_fn in ("_build_structural_edges", "_build_hierarchy_edges",
+                        "_build_category_edges", "_build_same_entity_type_edges"):
+            setattr(b, edge_fn, MagicMock(return_value=None))
+        b.get_entity_summary = MagicMock(return_value=MagicMock(
+            count=MagicMock(return_value=0), collect=MagicMock(return_value=[])))
+        b.generate_discovery_diff = MagicMock(return_value={})
+        b._purge_entities_for_rebuild = MagicMock(return_value=0)
+        return b
+
+    def test_purge_called_on_non_incremental_sweep(self):
+        b = self._builder(incremental=False)
+        b.config.table_names = None
+        b.run(sweep_stale_entities=True)
+        b._purge_entities_for_rebuild.assert_called_once_with(None)
+
+    def test_purge_scoped_to_table_names(self):
+        b = self._builder(incremental=False)
+        b.config.table_names = ["cat.sch.patients"]
+        b.run(sweep_stale_entities=True)
+        b._purge_entities_for_rebuild.assert_called_once_with(["cat.sch.patients"])
+
+    def test_purge_skipped_when_incremental(self):
+        b = self._builder(incremental=True)
+        b.run(sweep_stale_entities=True)
+        b._purge_entities_for_rebuild.assert_not_called()
+
+    def test_purge_skipped_without_sweep(self):
+        b = self._builder(incremental=False)
+        b.run(sweep_stale_entities=False)
+        b._purge_entities_for_rebuild.assert_not_called()
+
+
+class TestSourceTablesScopeSQL:
+    """_source_tables_scope_sql builds an array-intersect clause scoping the purge."""
+
+    def test_empty_is_no_scope(self):
+        from dbxmetagen.ontology import OntologyBuilder
+        assert OntologyBuilder._source_tables_scope_predicate(None) == ""
+        assert OntologyBuilder._source_tables_scope_predicate([]) == ""
+
+    def test_literal_tables(self):
+        from dbxmetagen.ontology import OntologyBuilder
+        sql = OntologyBuilder._source_tables_scope_predicate(["c.s.a", "c.s.b"])
+        assert "exists(source_tables, x -> x IN ('c.s.a', 'c.s.b'))" in sql
+        # Predicate has no leading AND (callers compose it).
+        assert not sql.startswith("AND")
+
+    def test_wildcard_prefix(self):
+        from dbxmetagen.ontology import OntologyBuilder
+        sql = OntologyBuilder._source_tables_scope_predicate(["c.s.*"])
+        assert "exists(source_tables, x -> x LIKE 'c.s.%')" in sql
+
+    def test_single_quote_escaped(self):
+        from dbxmetagen.ontology import OntologyBuilder
+        sql = OntologyBuilder._source_tables_scope_predicate(["c.s.o'brien"])
+        assert "o''brien" in sql
+
+
+class TestBuildOntologySweepThreading:
+    """build_ontology must forward sweep_stale_entities into builder.run()."""
+
+    def test_build_ontology_forwards_sweep_stale_entities(self):
+        with patch("dbxmetagen.ontology.OntologyBuilder") as MockBuilder:
+            instance = MockBuilder.return_value
+            instance.run.return_value = {}
+            build_ontology(MagicMock(), "cat", "sch", sweep_stale_entities=True)
+            _, kwargs = instance.run.call_args
+            assert kwargs.get("sweep_stale_entities") is True
+
+
+class TestStructuralEdgeResolver:
+    """_build_structural_edges named-relationship edges must resolve src/dst within the
+    SAME bundle and must not re-emit category edges that have a dedicated builder."""
+
+    def _rel_sql(self, builder):
+        builder._build_structural_edges()
+        calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        rel = [s for s in calls if "relationship_name NOT IN" in s]
+        assert len(rel) == 1
+        return rel[0]
+
+    def test_same_bundle_resolver_predicate(self):
+        builder = _make_builder_with_config({"A": {}}, bundle="fhir_r4")
+        sql = self._rel_sql(builder)
+        # Same-bundle comparison, NOT a current-bundle literal filter.
+        assert "se.ontology_bundle = de.ontology_bundle" in sql
+        assert "se.ontology_bundle = 'fhir_r4'" not in sql
+
+    def test_blocklist_excludes_only_category_edges(self):
+        builder = _make_builder_with_config({"A": {}}, bundle="fhir_r4")
+        sql = self._rel_sql(builder)
+        # Quoted forms appear only in the NOT IN list (the comment uses unquoted names).
+        assert "NOT IN" in sql
+        assert "'categorized_as'" in sql
+        assert "'category_of'" in sql
+
+    def test_blocklist_preserves_bundle_structural_edges(self):
+        # contains/part_of/member_of/has_part are bundle-defined tier-1 edges emitted ONLY
+        # by this function -- they must NOT be excluded (quoted forms never appear).
+        builder = _make_builder_with_config({"A": {}}, bundle="fhir_r4")
+        sql = self._rel_sql(builder)
+        for name in ("'contains'", "'part_of'", "'member_of'", "'has_part'", "'contained_in'"):
+            assert name not in sql
+
+
+class TestInterEntitySameBundle:
+    """discover_inter_entity_relationships must require both FK-resolved entity endpoints
+    to share a bundle (second cross-bundle vector)."""
+
+    def test_same_bundle_where_clause(self):
+        src = inspect.getsource(OntologyBuilder.discover_inter_entity_relationships)
+        assert 'F.col("se.ontology_bundle") == F.col("de.ontology_bundle")' in src
+
+
+class TestPurgeOrphanedBundleSeeds:
+    """_purge_orphaned_bundle_seeds removes table-less seeds of bundles that no longer
+    have any table-attributed entities, then drops the orphaned concept nodes."""
+
+    def test_deletes_orphan_seeds_and_nodes(self):
+        builder = _make_builder_with_config({}, bundle="fhir_r4")
+        builder._purge_orphaned_bundle_seeds()
+        calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        ent_del = [s for s in calls if s.lstrip().startswith("DELETE FROM")
+                   and "ontology_entities" in s and "node_type" not in s]
+        assert len(ent_del) == 1
+        d = ent_del[0]
+        assert "COALESCE(auto_discovered, TRUE) = TRUE" in d
+        assert "cardinality(source_tables) = 0" in d
+        # Orphan test: bundle not among those that still have table-attributed entities.
+        assert "NOT IN" in d and "cardinality(source_tables) > 0" in d
+        node_del = [s for s in calls if s.lstrip().startswith("DELETE FROM")
+                    and "node_type = 'entity'" in s]
+        assert len(node_del) == 1
+        assert OntologyBuilder.CANONICAL_ID_SQL in node_del[0]
+
+    def test_noop_when_no_orphans(self):
+        from types import SimpleNamespace
+        builder = _make_builder_with_config({}, bundle="fhir_r4")
+        builder.spark.sql.return_value.collect.return_value = [SimpleNamespace(c=0)]
+        builder._purge_orphaned_bundle_seeds()
+        calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        assert not any(s.lstrip().startswith("DELETE FROM") for s in calls)
+
+
+class TestPurgeStaleRelationships:
+    """_purge_stale_relationships deletes ALL auto-generated rows (incl. configured) + NULL,
+    preserving any future human-authored source."""
+
+    def test_delete_allowlist(self):
+        builder = _make_builder_with_config({}, bundle="fhir_r4")
+        builder._purge_stale_relationships()
+        calls = [c[0][0] for c in builder.spark.sql.call_args_list]
+        d = [s for s in calls if s.lstrip().startswith("DELETE FROM")
+             and "ontology_relationships" in s]
+        assert len(d) == 1
+        for src in ("'bundle'", "'fk_inferred'", "'discovered'", "'auto_inverse'", "'configured'"):
+            assert src in d[0]
+        assert "source IS NULL" in d[0]
+
+
+class TestOrphanedSeedAndRelSweepGating:
+    """New sweeps run only on a non-incremental sweep, via run() and refresh_relationships()."""
+
+    _STUBS = [
+        "create_entities_table", "create_metrics_table",
+        "discover_and_store_entities", "discover_and_store_column_entities",
+        "backfill_source_columns", "classify_entity_roles", "_deduplicate_primary_entities",
+        "_flag_low_confidence_primaries", "classify_column_properties",
+        "validate_entity_conformance", "discover_named_relationships", "emit_bundle_edges",
+        "_seed_concept_parent_entities", "_sync_entity_nodes_to_graph",
+        "_enrich_table_nodes_with_ontology", "validate_ontology_completeness",
+        "compute_ontology_metrics", "apply_entity_tags", "_get_bundle_version",
+        "_store_discovery_diff", "_serialize_turtle", "_purge_entities_for_rebuild",
+        "_purge_orphaned_bundle_seeds", "_purge_stale_relationships",
+    ]
+
+    def _builder(self, incremental):
+        b = _make_builder_with_config({}, bundle="schema_org")
+        b.config.incremental = incremental
+        b.config.table_names = None
+        for name in self._STUBS:
+            setattr(b, name, MagicMock(return_value=0))
+        b._snapshot_ontology_state = MagicMock(return_value={})
+        b.discover_inter_entity_relationships = MagicMock(return_value={})
+        for edge_fn in ("_build_structural_edges", "_build_hierarchy_edges",
+                        "_build_category_edges", "_build_same_entity_type_edges"):
+            setattr(b, edge_fn, MagicMock(return_value=None))
+        b.get_entity_summary = MagicMock(return_value=MagicMock(
+            count=MagicMock(return_value=0), collect=MagicMock(return_value=[])))
+        b.generate_discovery_diff = MagicMock(return_value={})
+        return b
+
+    def test_sweeps_called_on_non_incremental_sweep(self):
+        b = self._builder(incremental=False)
+        b.run(sweep_stale_entities=True)
+        b._purge_orphaned_bundle_seeds.assert_called_once()
+        b._purge_stale_relationships.assert_called_once()
+
+    def test_sweeps_skipped_when_incremental(self):
+        b = self._builder(incremental=True)
+        b.run(sweep_stale_entities=True)
+        b._purge_orphaned_bundle_seeds.assert_not_called()
+        b._purge_stale_relationships.assert_not_called()
+
+    def test_sweeps_skipped_without_sweep_flag(self):
+        b = self._builder(incremental=False)
+        b.run(sweep_stale_entities=False)
+        b._purge_orphaned_bundle_seeds.assert_not_called()
+        b._purge_stale_relationships.assert_not_called()
+
+    def test_refresh_rel_sweep_gated_non_incremental(self):
+        src = inspect.getsource(OntologyBuilder.refresh_relationships)
+        assert "_purge_stale_relationships" in src
+        assert "not incremental" in src
+
+
+class TestReconcileEntityRoles:
+    """SQL-shape and wiring tests for reconcile_entity_roles and its callers."""
+
+    ENT = "c.s.ontology_entities"
+
+    def _spark(self):
+        spark = MagicMock()
+        spark.sql.return_value.collect.return_value = []
+        spark.sql.return_value.first.return_value = None
+        return spark
+
+    def _sqls(self, spark):
+        return [c[0][0] for c in spark.sql.call_args_list]
+
+    def test_ordering_classify_then_dedup_then_flag(self):
+        from dbxmetagen.ontology import reconcile_entity_roles
+        spark = self._spark()
+        reconcile_entity_roles(spark, self.ENT)
+        sqls = self._sqls(spark)
+        i_classify = next(i for i, s in enumerate(sqls) if "computed_role" in s)
+        i_dedup = next(i for i, s in enumerate(sqls)
+                       if "WHEN MATCHED AND target.auto_discovered = TRUE" in s)
+        i_flag = next(i for i, s in enumerate(sqls) if "needs_human_review" in s)
+        assert i_classify < i_dedup < i_flag
+
+    def test_unscoped_omits_scope_and_runs_orphan_update(self):
+        from dbxmetagen.ontology import reconcile_entity_roles
+        spark = self._spark()
+        reconcile_entity_roles(spark, self.ENT)
+        sqls = self._sqls(spark)
+        classify = next(s for s in sqls if "computed_role" in s)
+        assert "WHERE 1=1" not in classify
+        assert "tbl IN (" not in classify
+        # orphan default-to-referenced UPDATE only runs on the unscoped path
+        assert any("source_tables IS NULL OR SIZE(source_tables) = 0" in s for s in sqls)
+
+    def test_scoped_filters_writes_and_skips_orphan_update(self):
+        from dbxmetagen.ontology import reconcile_entity_roles
+        spark = self._spark()
+        reconcile_entity_roles(spark, self.ENT, table_names=["c.s.t1"])
+        sqls = self._sqls(spark)
+        classify = next(s for s in sqls if "computed_role" in s)
+        assert "WHERE 1=1" in classify
+        assert "tbl IN ('c.s.t1')" in classify
+        flag = next(s for s in sqls if "needs_human_review" in s)
+        assert "get(source_tables, 0) IN ('c.s.t1')" in flag
+        # scoped path must not touch out-of-scope orphan entities
+        assert not any("source_tables IS NULL OR SIZE(source_tables) = 0" in s for s in sqls)
+
+    def test_validator_reconcile_delegates_with_scope(self):
+        from dbxmetagen.ontology_validator import (
+            OntologyValidator, OntologyValidatorConfig,
+        )
+        cfg = OntologyValidatorConfig(catalog_name="c", schema_name="s")
+        validator = OntologyValidator(MagicMock(), cfg)
+        validator._table_names = ["c.s.t1"]
+        with patch("dbxmetagen.ontology.reconcile_entity_roles") as mock_rec:
+            mock_rec.return_value = 7
+            n = validator._reconcile_roles()
+        assert n == 7
+        mock_rec.assert_called_once_with(
+            validator.spark, cfg.fully_qualified_entities, ["c.s.t1"],
+        )
+
+    def test_validator_run_reconciles_on_both_paths(self):
+        from dbxmetagen.ontology_validator import OntologyValidator
+        src = inspect.getsource(OntologyValidator.run)
+        assert src.count("_reconcile_roles()") >= 2
+
+    def test_build_early_exit_reconciles_roles(self):
+        src = inspect.getsource(OntologyBuilder.run)
+        assert "reconcile_entity_roles" in src
+
+    def test_refresh_watermark_checks_entity_roles(self):
+        src = inspect.getsource(OntologyBuilder.refresh_relationships)
+        assert "source = 'bundle'" in src
+        assert "fully_qualified_entities" in src
+        assert "max_ent <= max_bundle" in src
+
+
+class TestResolveTierDir:
+    """_resolve_tier_dir handles built-in/local and Volume-style bundle paths."""
+
+    def _write_bundle(self, path: Path):
+        path.write_text(
+            "metadata:\n"
+            "  name: mybundle\n"
+            "ontology:\n"
+            "  entities:\n"
+            "    definitions:\n"
+            "      Patient:\n"
+            "        description: A person receiving care\n"
+            "      Encounter:\n"
+            "        description: An interaction event\n",
+            encoding="utf-8",
+        )
+
+    def test_returns_sibling_dir_when_tiers_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            yaml_path = base / "mybundle.yaml"
+            self._write_bundle(yaml_path)
+            tier_dir = base / "mybundle"
+            tier_dir.mkdir()
+            (tier_dir / "entities_tier1.json").write_text("[]", encoding="utf-8")
+
+            assert _resolve_tier_dir(str(yaml_path)) == str(tier_dir)
+
+    def test_regenerates_tiers_when_sibling_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            yaml_path = Path(d) / "mybundle.yaml"
+            self._write_bundle(yaml_path)
+
+            result = _resolve_tier_dir(str(yaml_path))
+            assert result is not None
+            out = Path(result)
+            assert (out / "entities_tier1.json").is_file() or (out / "entities_tier1.yaml").is_file()
+
+    def test_returns_none_when_yaml_missing_and_no_tiers(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "nope.yaml"
+            assert _resolve_tier_dir(str(missing)) is None
+
+
+def _rdflib_available():
+    try:
+        import rdflib  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class TestProcessBundleProperties:
+    """ontology_properties.process_bundle generates roles and syncs property_roles."""
+
+    def test_generates_roles_from_typical_attributes(self):
+        from dbxmetagen.ontology_properties import process_bundle
+
+        bundle = {
+            "metadata": {"name": "imported"},
+            "ontology": {
+                "property_roles": {},
+                "edge_catalog": {},
+                "entities": {
+                    "definitions": {
+                        "Patient": {
+                            "description": "A patient",
+                            "typical_attributes": ["patient_id", "birth_date", "full_name"],
+                            "relationships": {},
+                            "properties": {},
+                        }
+                    }
+                },
+            },
+        }
+        ent_count, _new, _preserved = process_bundle(bundle, "imported")
+        assert ent_count == 1
+        props = bundle["ontology"]["entities"]["definitions"]["Patient"]["properties"]
+        roles = {p["role"] for p in props.values()}
+        # Should infer non-trivial roles, not a single naive "dimension" for everything.
+        assert "primary_key" in roles or "business_key" in roles
+        assert roles != {"dimension"}
+
+    def test_syncs_canonical_property_roles(self):
+        from dbxmetagen.ontology_properties import process_bundle
+        from dbxmetagen.ontology_roles import property_roles_for_yaml
+
+        bundle = {
+            "metadata": {"name": "imported"},
+            "ontology": {
+                "property_roles": {"stale": {}},
+                "entities": {"definitions": {}},
+            },
+        }
+        process_bundle(bundle, "imported")
+        assert bundle["ontology"]["property_roles"] == property_roles_for_yaml()
+
+    def test_preserves_existing_object_property(self):
+        from dbxmetagen.ontology_properties import process_bundle
+
+        existing = {
+            "kind": "object_property", "role": "object_property",
+            "edge": "has_encounter", "target_entity": "Encounter",
+            "typical_attributes": ["encounter_id"],
+        }
+        bundle = {
+            "metadata": {"name": "imported"},
+            "ontology": {
+                "edge_catalog": {},
+                "entities": {
+                    "definitions": {
+                        "Patient": {
+                            "typical_attributes": [],
+                            "relationships": {},
+                            "properties": {"has_encounter": dict(existing)},
+                        }
+                    }
+                },
+            },
+        }
+        process_bundle(bundle, "imported")
+        props = bundle["ontology"]["entities"]["definitions"]["Patient"]["properties"]
+        assert props["has_encounter"]["role"] == "object_property"
+        assert props["has_encounter"]["target_entity"] == "Encounter"
+
+
+class TestOwlImportFieldEmission:
+    """owl_to_bundle_yaml emits SKOS-derived fields and real property roles."""
+
+    _TTL = """
+    @prefix owl: <http://www.w3.org/2002/07/owl#> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+    @prefix ex: <http://example.org/> .
+
+    ex:Disease rdf:type owl:Class .
+    ex:RareDisease rdf:type owl:Class ;
+        rdfs:subClassOf ex:Disease, ex:Condition ;
+        skos:definition "A disease that is rare." ;
+        skos:prefLabel "Rare disease" ;
+        skos:altLabel "orphan disease" , "uncommon disease" .
+    ex:Condition rdf:type owl:Class .
+    """
+
+    @pytest.mark.skipif(not _rdflib_available(), reason="rdflib not installed")
+    def test_emits_synonyms_parents_and_skos_description(self):
+        from dbxmetagen.ontology_import import owl_to_bundle_yaml
+
+        with tempfile.NamedTemporaryFile(suffix=".ttl", mode="w", delete=False) as ttl:
+            ttl.write(self._TTL)
+            ttl.flush()
+            ttl_path = ttl.name
+        try:
+            bundle = owl_to_bundle_yaml(ttl_path, format_version="2.0", bundle_name="imported")
+            defs = bundle["ontology"]["entities"]["definitions"]
+            rare = defs["RareDisease"]
+            # SKOS definition becomes the description.
+            assert rare["description"] == "A disease that is rare."
+            # altLabels become synonyms (not just folded into keywords).
+            assert set(rare["synonyms"]) == {"orphan disease", "uncommon disease"}
+            # Multi-inheritance preserved via plural parents.
+            assert set(rare["parents"]) == {"Disease", "Condition"}
+            assert rare["parent"] in {"Disease", "Condition"}
+        finally:
+            os.unlink(ttl_path)
+
+    @pytest.mark.skipif(not _rdflib_available(), reason="rdflib not installed")
+    def test_property_roles_synced_to_canonical_registry(self):
+        from dbxmetagen.ontology_import import owl_to_bundle_yaml
+        from dbxmetagen.ontology_roles import property_roles_for_yaml
+
+        with tempfile.NamedTemporaryFile(suffix=".ttl", mode="w", delete=False) as ttl:
+            ttl.write(self._TTL)
+            ttl.flush()
+            ttl_path = ttl.name
+        try:
+            bundle = owl_to_bundle_yaml(ttl_path, format_version="2.0", bundle_name="imported")
+            assert bundle["ontology"]["property_roles"] == property_roles_for_yaml()
+        finally:
+            os.unlink(ttl_path)
+
+    @pytest.mark.skipif(not _rdflib_available(), reason="rdflib not installed")
+    def test_source_detection_ignores_unused_bound_namespaces(self):
+        """rdflib auto-binds schema.org/brick; detection must not false-positive.
+
+        This SKOS-annotated OWL file uses no schema.org triples, so it must be
+        detected as SKOS, not Schema.org.
+        """
+        from dbxmetagen.ontology_import import _detect_source_ontology
+        import rdflib
+
+        with tempfile.NamedTemporaryFile(suffix=".ttl", mode="w", delete=False) as ttl:
+            ttl.write(self._TTL)
+            ttl.flush()
+            ttl_path = ttl.name
+        try:
+            g = rdflib.Graph()
+            g.parse(ttl_path, format="turtle")
+            # schema.org is bound by default but unused -> must be ignored.
+            assert any("schema.org" in str(u) for _, u in g.namespaces())
+            assert _detect_source_ontology(g) == "SKOS"
+        finally:
+            os.unlink(ttl_path)
+
+
+def test_generate_bundle_properties_script_reexports():
+    """The CLI wrapper re-exports the moved functions from the src module."""
+    import importlib.util
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "generate_bundle_properties.py"
+    spec = importlib.util.spec_from_file_location("generate_bundle_properties", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for fn in ("process_bundle", "detect_source", "generate_owl_properties", "generate_pattern_properties"):
+        assert hasattr(mod, fn)
+
+
+
+
+class TestResilientColumnClassification:
+    """ON-19: batch column classification chunks by token budget and BISECTS on
+    truncation (StructuredTruncationError) instead of losing columns or defaulting."""
+
+    def _discoverer(self):
+        ontology_config = {"entities": {"discovery_confidence_threshold": 0.5, "definitions": {}}}
+        return EntityDiscoverer(MagicMock(), MagicMock(), ontology_config)
+
+    def _cols(self, n):
+        cols = []
+        for i in range(n):
+            c = MagicMock()
+            c.column_name = f"col_{i}"
+            cols.append(c)
+        return cols
+
+    def test_no_truncation_single_call(self):
+        d = self._discoverer()
+        cols = self._cols(10)
+        with patch.object(d, "_classify_column_chunk",
+                          return_value=[("x", "Entity", 0.9)]) as m:
+            d._classify_column_chunk_resilient("cat.sch.t", "t", cols)
+        m.assert_called_once()
+
+    def test_truncation_bisects(self):
+        from dbxmetagen.chat_client import StructuredTruncationError
+        d = self._discoverer()
+        cols = self._cols(4)
+        calls = []
+
+        def fake(short, chunk):
+            calls.append(len(chunk))
+            if len(chunk) > 2:
+                raise StructuredTruncationError("truncated")
+            return [(c.column_name, "Entity", 0.8) for c in chunk]
+
+        with patch.object(d, "_classify_column_chunk", side_effect=fake):
+            out = d._classify_column_chunk_resilient("cat.sch.t", "t", cols)
+        # 4 (fail) -> 2 + 2 (succeed): all 4 columns recovered, none lost.
+        assert len(out) == 4
+        assert calls[0] == 4 and 2 in calls[1:]
+
+    def test_single_column_truncation_falls_back_to_ai_query(self):
+        from dbxmetagen.chat_client import StructuredTruncationError
+        d = self._discoverer()
+        cols = self._cols(1)
+        with patch.object(d, "_classify_column_chunk",
+                          side_effect=StructuredTruncationError("t")), \
+             patch.object(d, "_ai_query_classify_columns",
+                          return_value=[("col_0", "Entity", 0.5)]) as m:
+            out = d._classify_column_chunk_resilient("cat.sch.t", "t", cols)
+        m.assert_called_once()
+        assert len(out) == 1
+
+    def test_chunking_uses_token_budget_constant(self):
+        from dbxmetagen.ontology import _COLS_PER_CLASSIFY_CHUNK
+        # The wide-table case from the customer log (144 cols) must split, not
+        # go in one call at the old 120+*1.25 ceiling.
+        assert _COLS_PER_CLASSIFY_CHUNK <= 100
+        d = self._discoverer()
+        cols = self._cols(144)
+        seen = []
+        with patch.object(d, "_classify_column_chunk",
+                          side_effect=lambda s, ch: seen.append(len(ch)) or
+                          [(c.column_name, "E", 0.7) for c in ch]):
+            out = d._ai_classify_columns_for_table("cat.sch.t", "t", cols)
+        assert len(out) == 144
+        assert max(seen) <= _COLS_PER_CLASSIFY_CHUNK

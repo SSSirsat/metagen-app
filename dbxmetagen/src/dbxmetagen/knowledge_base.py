@@ -1,0 +1,589 @@
+"""
+Knowledge Base ETL module.
+
+Transforms row-based metadata_generation_log into table-centric table_knowledge_base
+with aggregated metadata from comment, domain, and PI classification runs.
+"""
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+from pyspark.sql import SparkSession, DataFrame
+
+from dbxmetagen.table_filter import table_filter_sql
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+_MERGE_MAX_RETRIES = 3
+_MERGE_BACKOFF_SECONDS = [5, 15, 45]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class KnowledgeBaseConfig:
+    """Configuration for knowledge base ETL."""
+    catalog_name: str
+    schema_name: str
+    source_table: str = "metadata_generation_log"
+    target_table: str = "table_knowledge_base"
+    table_names: list[str] | None = None
+
+    @property
+    def fully_qualified_source(self) -> str:
+        return f"{self.catalog_name}.{self.schema_name}.{self.source_table}"
+    
+    @property
+    def fully_qualified_target(self) -> str:
+        return f"{self.catalog_name}.{self.schema_name}.{self.target_table}"
+
+
+def parse_table_name_parts(table_name: str) -> Dict[str, Optional[str]]:
+    """
+    Parse a fully qualified table name into catalog, schema, and table parts.
+    
+    Args:
+        table_name: Fully qualified table name (e.g., "catalog.schema.table")
+        
+    Returns:
+        Dict with keys: catalog, schema, table_short_name
+    """
+    if not table_name:
+        return {"catalog": None, "schema": None, "table_short_name": None}
+    
+    parts = table_name.split(".")
+    
+    return {
+        "catalog": parts[0] if len(parts) >= 1 else None,
+        "schema": parts[1] if len(parts) >= 2 else None,
+        "table_short_name": parts[2] if len(parts) >= 3 else table_name
+    }
+
+
+def classify_has_pii(classification: Optional[str]) -> bool:
+    """
+    Determine if a classification indicates PII presence.
+    
+    Args:
+        classification: The PI classification value (e.g., 'pii', 'phi', 'pci')
+        
+    Returns:
+        True if classification indicates PII/PHI/PCI, False otherwise
+    """
+    if not classification:
+        return False
+    return classification.lower() in ('pii', 'phi', 'pci')
+
+
+def classify_has_phi(classification: Optional[str]) -> bool:
+    """
+    Determine if a classification indicates PHI presence.
+    
+    Args:
+        classification: The PI classification value
+        
+    Returns:
+        True if classification indicates PHI specifically, False otherwise
+    """
+    if not classification:
+        return False
+    return classification.lower() == 'phi'
+
+
+class KnowledgeBaseBuilder:
+    """
+    Builder class for transforming metadata_generation_log into table_knowledge_base.
+    
+    This class encapsulates the ETL logic and can be used from notebooks or jobs.
+    """
+    
+    def __init__(self, spark: SparkSession, config: KnowledgeBaseConfig):
+        """
+        Initialize the knowledge base builder.
+        
+        Args:
+            spark: SparkSession instance
+            config: KnowledgeBaseConfig with source/target settings
+        """
+        self.spark = spark
+        self.config = config
+    
+    def create_target_table(self) -> None:
+        """Create the target table if it doesn't exist."""
+        # Note: `schema` is a reserved word in SQL, must be escaped with backticks
+        ddl = f"""
+        CREATE TABLE IF NOT EXISTS {self.config.fully_qualified_target} (
+            table_name STRING NOT NULL,
+            catalog STRING,
+            `schema` STRING,
+            table_short_name STRING,
+            comment STRING,
+            domain STRING,
+            subdomain STRING,
+            has_pii BOOLEAN,
+            has_phi BOOLEAN,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            review_updated_at TIMESTAMP
+        )
+        CLUSTER BY (catalog, `schema`)
+        COMMENT 'Aggregated table-level metadata from dbxmetagen runs'
+        """
+        self.spark.sql(ddl)
+        logger.info(f"Target table {self.config.fully_qualified_target} ready")
+    
+    def read_source_data(self) -> DataFrame:
+        """
+        Read and filter source data from metadata_generation_log.
+        
+        Returns:
+            DataFrame with source data filtered to non-null table names
+        """
+        tf = table_filter_sql(self.config.table_names or [], column="`table`")
+        df = self.spark.sql(f"""
+            SELECT 
+                LOWER(`table`) as table_name,
+                metadata_type,
+                ddl_type,
+                column_name,
+                column_content,
+                domain,
+                subdomain,
+                classification,
+                type,
+                _created_at
+            FROM {self.config.fully_qualified_source}
+            WHERE `table` IS NOT NULL
+            {tf}
+        """)
+        return df
+    
+    def extract_table_comments(self, source_df: DataFrame) -> DataFrame:
+        """
+        Extract table-level comments, keeping most recent per table.
+        
+        Args:
+            source_df: Source DataFrame from metadata_generation_log
+            
+        Returns:
+            DataFrame with table_name and comment columns
+        """
+        window = Window.partitionBy("table_name").orderBy(F.desc("_created_at"))
+        
+        return (
+            source_df
+            .filter(
+                (F.col("metadata_type") == "comment") & 
+                (F.col("ddl_type") == "table")
+            )
+            .withColumn("rn", F.row_number().over(window))
+            .filter(F.col("rn") == 1)
+            .select(
+                F.col("table_name"),
+                F.col("column_content").alias("comment")
+            )
+        )
+    
+    def extract_domain_data(self, source_df: DataFrame) -> DataFrame:
+        """
+        Extract domain classification, keeping most recent per table.
+        
+        Args:
+            source_df: Source DataFrame from metadata_generation_log
+            
+        Returns:
+            DataFrame with table_name, domain, subdomain columns
+        """
+        window = Window.partitionBy("table_name").orderBy(F.desc("_created_at"))
+        
+        return (
+            source_df
+            .filter(
+                (F.col("metadata_type") == "domain") & 
+                (F.col("ddl_type") == "table")
+            )
+            .withColumn("rn", F.row_number().over(window))
+            .filter(F.col("rn") == 1)
+            .select(
+                F.col("table_name"),
+                F.col("domain"),
+                F.col("subdomain")
+            )
+        )
+    
+    def extract_pi_data(self, source_df: DataFrame) -> DataFrame:
+        """
+        Aggregate PI classifications at table level.
+        
+        A table has_pii if ANY column has PII/PHI/PCI type.
+        A table has_phi if ANY column has PHI type.
+        
+        Args:
+            source_df: Source DataFrame from metadata_generation_log
+            
+        Returns:
+            DataFrame with table_name, has_pii, has_phi columns
+        """
+        return (
+            source_df
+            .filter(F.col("metadata_type") == "pi")
+            .groupBy("table_name")
+            .agg(
+                F.max(
+                    F.when(
+                        F.lower(F.col("type")).isin("pii", "phi", "pci"),
+                        F.lit(True)
+                    ).otherwise(F.lit(False))
+                ).alias("has_pii"),
+                F.max(
+                    F.when(
+                        F.lower(F.col("type")) == "phi",
+                        F.lit(True)
+                    ).otherwise(F.lit(False))
+                ).alias("has_phi")
+            )
+        )
+    
+    def get_all_tables_with_timestamps(self, source_df: DataFrame) -> DataFrame:
+        """
+        Get all distinct tables with their first and last seen timestamps.
+        
+        Args:
+            source_df: Source DataFrame from metadata_generation_log
+            
+        Returns:
+            DataFrame with table_name, first_seen, last_updated columns
+        """
+        return (
+            source_df
+            .groupBy("table_name")
+            .agg(
+                F.min("_created_at").alias("first_seen"),
+                F.max("_created_at").alias("last_updated")
+            )
+        )
+    
+    def build_staged_updates(self) -> DataFrame:
+        """
+        Build the staged updates DataFrame by joining all metadata types.
+        
+        Returns:
+            DataFrame ready to be merged into the target table
+        """
+        source_df = self.read_source_data()
+        
+        all_tables = self.get_all_tables_with_timestamps(source_df)
+        table_comments = self.extract_table_comments(source_df)
+        domain_data = self.extract_domain_data(source_df)
+        pi_data = self.extract_pi_data(source_df)
+        
+        # Join all data together
+        result = (
+            all_tables
+            .join(table_comments, "table_name", "left")
+            .join(domain_data, "table_name", "left")
+            .join(pi_data, "table_name", "left")
+        )
+        
+        # Parse table name parts and add defaults for PI columns
+        result = (
+            result
+            .withColumn("catalog", F.split(F.col("table_name"), "\\.").getItem(0))
+            .withColumn(
+                "schema",
+                F.when(
+                    F.size(F.split(F.col("table_name"), "\\.")) >= 2,
+                    F.split(F.col("table_name"), "\\.").getItem(1)
+                ).otherwise(F.lit(None))
+            )
+            .withColumn(
+                "table_short_name",
+                F.when(
+                    F.size(F.split(F.col("table_name"), "\\.")) >= 3,
+                    F.split(F.col("table_name"), "\\.").getItem(2)
+                ).otherwise(F.col("table_name"))
+            )
+            .withColumn("has_pii", F.coalesce(F.col("has_pii"), F.lit(False)))
+            .withColumn("has_phi", F.coalesce(F.col("has_phi"), F.lit(False)))
+            .withColumnRenamed("first_seen", "created_at")
+            .withColumnRenamed("last_updated", "updated_at")
+        )
+        
+        # Rename 'schema' to escaped version for SQL compatibility
+        return result.select(
+            "table_name", "catalog", 
+            F.col("schema").alias("schema"),  # PySpark handles escaping internally
+            "table_short_name",
+            "comment", "domain", "subdomain", "has_pii", "has_phi",
+            "created_at", "updated_at"
+        )
+    
+    def merge_to_target(self, staged_df: DataFrame) -> Dict[str, int]:
+        """
+        Merge staged updates into the target table.
+        
+        Uses COALESCE to preserve existing values when source has NULL,
+        and OR logic for boolean flags to ensure once-true-always-true.
+        
+        Args:
+            staged_df: DataFrame with staged updates
+            
+        Returns:
+            Dict with merge statistics (rows_affected)
+        """
+        # Create temp view for the merge
+        staged_df.createOrReplaceTempView("staged_updates")
+        
+        # Note: `schema` is a reserved word in SQL, must be escaped with backticks
+        # MERGE: Upserts KB target from `staged_updates` on `table_name`; MATCH updates catalog/schema/table_short_name with COALESCE, CASE-preserves comment/domain/subdomain/has_pii/has_phi when target.review_updated_at is newer than source.updated_at, sets updated_at = GREATEST; NOT MATCHED inserts full row.
+        # WHY: Makes `metadata_generation_log`-derived table semantics the durable, queryable KB for graph/Genie/dashboard while preventing steward-corrected fields from being overwritten by a later pipeline run unless review is stale.
+        # TRADEOFFS: MERGE handles concurrency (with retries) better than truncate-load, but COALESCE can keep aging non-review fields if upstream stops sending them. When no review exists, PI booleans still use OR-merge (conservative).
+        merge_sql = f"""
+        MERGE INTO {self.config.fully_qualified_target} AS target
+        USING staged_updates AS source
+        ON LOWER(target.table_name) = LOWER(source.table_name)
+
+        WHEN MATCHED THEN UPDATE SET
+            target.table_name = source.table_name,
+            target.catalog = COALESCE(source.catalog, target.catalog),
+            target.`schema` = COALESCE(source.`schema`, target.`schema`),
+            target.table_short_name = COALESCE(source.table_short_name, target.table_short_name),
+            target.comment = CASE
+                WHEN target.review_updated_at IS NOT NULL AND target.review_updated_at > source.updated_at
+                THEN target.comment ELSE COALESCE(source.comment, target.comment) END,
+            target.domain = CASE
+                WHEN target.review_updated_at IS NOT NULL AND target.review_updated_at > source.updated_at
+                THEN target.domain ELSE COALESCE(source.domain, target.domain) END,
+            target.subdomain = CASE
+                WHEN target.review_updated_at IS NOT NULL AND target.review_updated_at > source.updated_at
+                THEN target.subdomain ELSE COALESCE(source.subdomain, target.subdomain) END,
+            target.has_pii = CASE
+                WHEN target.review_updated_at IS NOT NULL AND target.review_updated_at > source.updated_at
+                THEN target.has_pii ELSE (source.has_pii OR target.has_pii) END,
+            target.has_phi = CASE
+                WHEN target.review_updated_at IS NOT NULL AND target.review_updated_at > source.updated_at
+                THEN target.has_phi ELSE (source.has_phi OR target.has_phi) END,
+            target.updated_at = GREATEST(source.updated_at, target.updated_at)
+
+        WHEN NOT MATCHED THEN INSERT (
+            table_name, catalog, `schema`, table_short_name,
+            comment, domain, subdomain, has_pii, has_phi,
+            created_at, updated_at
+        ) VALUES (
+            source.table_name, source.catalog, source.`schema`, source.table_short_name,
+            source.comment, source.domain, source.subdomain, source.has_pii, source.has_phi,
+            source.created_at, source.updated_at
+        )
+        """
+        
+        for attempt in range(_MERGE_MAX_RETRIES + 1):
+            try:
+                self.spark.sql(merge_sql)
+                break
+            except Exception as e:
+                err = str(e)
+                if attempt < _MERGE_MAX_RETRIES and ("Concurrent" in err or "DELTA_CONCURRENT" in err):
+                    wait = _MERGE_BACKOFF_SECONDS[attempt]
+                    logger.warning("MERGE conflict (attempt %d), retrying in %ds: %s", attempt + 1, wait, err[:200])
+                    time.sleep(wait)
+                else:
+                    raise
+        
+        count = self.spark.sql(
+            f"SELECT COUNT(*) as cnt FROM {self.config.fully_qualified_target}"
+        ).collect()[0]["cnt"]
+        
+        return {"total_records": count}
+    
+    def run(self) -> Dict[str, Any]:
+        """
+        Execute the full ETL pipeline.
+        
+        Returns:
+            Dict with execution statistics
+        """
+        logger.info(f"Starting knowledge base build: {self.config.fully_qualified_target}")
+        
+        # Create target table
+        self.create_target_table()
+        
+        # Build staged updates
+        staged_df = self.build_staged_updates()
+        staged_count = staged_df.count()
+        logger.info(f"Staged {staged_count} table records for merge")
+        
+        # Merge to target
+        merge_stats = self.merge_to_target(staged_df)
+        
+        logger.info(f"Knowledge base build complete. Total records: {merge_stats['total_records']}")
+        
+        return {
+            "staged_count": staged_count,
+            "total_records": merge_stats["total_records"]
+        }
+
+    def bootstrap(self, table_names: List[str]) -> int:
+        """Populate KB from information_schema with zero LLM calls.
+
+        Inserts only rows that don't already exist (MERGE WHEN NOT MATCHED).
+        Includes existing UC table comments. Returns the number of rows merged.
+        """
+        self.create_target_table()
+        by_catalog_schema: Dict[str, List[str]] = {}
+        for fqtn in table_names:
+            parts = fqtn.split(".")
+            if len(parts) != 3:
+                continue
+            key = f"{parts[0]}.{parts[1]}"
+            by_catalog_schema.setdefault(key, []).append(parts[2])
+
+        all_dfs = []
+        for cs_key, short_names in by_catalog_schema.items():
+            cat, sch = cs_key.split(".", 1)
+            in_clause = ", ".join(f"'{t}'" for t in short_names)
+            try:
+                df = self.spark.sql(f"""
+                    SELECT
+                        CONCAT(table_catalog, '.', table_schema, '.', table_name) AS table_name,
+                        table_catalog AS catalog,
+                        table_schema AS `schema`,
+                        table_name AS table_short_name,
+                        comment,
+                        CAST(NULL AS STRING) AS domain,
+                        CAST(NULL AS STRING) AS subdomain,
+                        false AS has_pii,
+                        false AS has_phi,
+                        current_timestamp() AS created_at,
+                        current_timestamp() AS updated_at,
+                        CAST(NULL AS TIMESTAMP) AS review_updated_at
+                    FROM system.information_schema.tables
+                    WHERE table_catalog = '{cat}' AND table_schema = '{sch}'
+                      AND table_name IN ({in_clause})
+                      AND table_type IN ('MANAGED', 'EXTERNAL', 'FOREIGN')
+                """)
+                all_dfs.append(df)
+            except Exception as e:
+                logger.warning("Bootstrap: could not query %s.information_schema.tables: %s", cat, e)
+
+        if not all_dfs:
+            return 0
+
+        from functools import reduce
+        combined = reduce(lambda a, b: a.union(b), all_dfs)
+        combined.createOrReplaceTempView("_kb_bootstrap_src")
+
+        # MERGE: `WHEN NOT MATCHED THEN INSERT *` into table KB from `_kb_bootstrap_src` on `table_name`, seeding managed/external tables from each catalog's `information_schema.tables` with UC comment, null domain/subdomain, false PI flags, and current timestamps.
+        # WHY: Zero-LLM inventory so graph/dashboard have rows immediately; full `merge_to_target` then layers generated metadata without clobbering existing enriched rows.
+        # TRADEOFFS: Insert-only is safe for mixed maturity but never removes stale keys; `INSERT *` requires source/target column alignment; scope is only tables named in the bootstrap list.
+        self.spark.sql(f"""
+            MERGE INTO {self.config.fully_qualified_target} AS target
+            USING _kb_bootstrap_src AS source
+            ON target.table_name = source.table_name
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+        count = combined.count()
+        logger.info("Bootstrap: merged %d table rows into %s", count, self.config.fully_qualified_target)
+        return count
+
+    def log_bootstrap_to_generation_log(self, table_names: List[str]) -> int:
+        """Write existing UC table comments to metadata_generation_log.
+
+        Creates rows matching the schema that ``mode=comment`` would produce,
+        with ``metadata_type='comment'`` and ``ddl_type='table'``.  Uses
+        ``model='import'`` so downstream consumers can distinguish bootstrap
+        rows from LLM-generated ones.
+        """
+        from dbxmetagen.processing import ensure_log_table
+
+        log_table = f"{self.config.catalog_name}.{self.config.schema_name}.metadata_generation_log"
+        ensure_log_table(self.spark, self.config.catalog_name, self.config.schema_name)
+
+        by_catalog_schema: Dict[str, List[str]] = {}
+        for fqtn in table_names:
+            parts = fqtn.split(".")
+            if len(parts) != 3:
+                continue
+            key = f"{parts[0]}.{parts[1]}"
+            by_catalog_schema.setdefault(key, []).append(parts[2])
+
+        all_dfs = []
+        for cs_key, short_names in by_catalog_schema.items():
+            cat, sch = cs_key.split(".", 1)
+            in_clause = ", ".join(f"'{t}'" for t in short_names)
+            try:
+                df = self.spark.sql(f"""
+                    SELECT
+                        'comment' AS metadata_type,
+                        CONCAT(table_catalog, '.', table_schema, '.', table_name) AS `table`,
+                        CAST(NULL AS STRING) AS tokenized_table,
+                        'table' AS ddl_type,
+                        'None' AS column_name,
+                        current_timestamp() AS _created_at,
+                        COALESCE(comment, '') AS column_content,
+                        CAST(NULL AS STRING) AS classification,
+                        CAST(NULL AS STRING) AS type,
+                        CAST(NULL AS DOUBLE) AS confidence,
+                        CAST(NULL AS STRING) AS presidio_results,
+                        CAST(NULL AS STRING) AS domain,
+                        CAST(NULL AS STRING) AS subdomain,
+                        CAST(NULL AS STRING) AS recommended_domain,
+                        CAST(NULL AS STRING) AS recommended_subdomain,
+                        CAST(NULL AS STRING) AS reasoning,
+                        CAST(NULL AS STRING) AS metadata_summary,
+                        table_catalog AS catalog,
+                        table_schema AS `schema`,
+                        table_name,
+                        CAST(NULL AS STRING) AS ddl,
+                        CAST(NULL AS STRING) AS current_user,
+                        'import' AS model,
+                        CAST(NULL AS INT) AS sample_size,
+                        CAST(NULL AS INT) AS max_tokens,
+                        CAST(NULL AS DOUBLE) AS temperature,
+                        CAST(NULL AS INT) AS columns_per_call,
+                        'bootstrap_import' AS status
+                    FROM system.information_schema.tables
+                    WHERE table_catalog = '{cat}' AND table_schema = '{sch}'
+                      AND table_name IN ({in_clause})
+                      AND table_type IN ('MANAGED', 'EXTERNAL', 'FOREIGN')
+                """)
+                all_dfs.append(df)
+            except Exception as e:
+                logger.warning("log_bootstrap: could not query %s.information_schema.tables: %s", cat, e)
+
+        if not all_dfs:
+            return 0
+
+        from functools import reduce
+        combined = reduce(lambda a, b: a.union(b), all_dfs)
+        combined.write.mode("append").option("mergeSchema", "true").saveAsTable(log_table)
+        count = combined.count()
+        logger.info("log_bootstrap: wrote %d table-level rows to %s", count, log_table)
+        return count
+
+
+def build_knowledge_base(
+    spark: SparkSession,
+    catalog_name: str,
+    schema_name: str,
+    table_names: list[str] | None = None,
+) -> Dict[str, Any]:
+    """
+    Convenience function to build the knowledge base.
+    
+    Args:
+        spark: SparkSession instance
+        catalog_name: Catalog name for source and target tables
+        schema_name: Schema name for source and target tables
+        
+    Returns:
+        Dict with execution statistics
+    """
+    config = KnowledgeBaseConfig(
+        catalog_name=catalog_name,
+        schema_name=schema_name,
+        table_names=table_names,
+    )
+    builder = KnowledgeBaseBuilder(spark, config)
+    return builder.run()
+
