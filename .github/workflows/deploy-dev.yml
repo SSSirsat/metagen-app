@@ -19,7 +19,7 @@ jobs:
     name: Deploy app to dev
     runs-on: ubuntu-latest
     env:
-      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
       BUNDLE_VAR_catalog_name: ${{ vars.DATABRICKS_CATALOG_NAME }}
       BUNDLE_VAR_schema_name: ${{ vars.DATABRICKS_SCHEMA_NAME }}
